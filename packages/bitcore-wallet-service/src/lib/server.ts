@@ -1,18 +1,28 @@
 import * as async from 'async';
+import * as crypto from 'crypto'
+import { Validation } from 'crypto-wallet-core';
 import * as _ from 'lodash';
+import Moralis from 'moralis';
 import 'source-map-support/register';
+import config from '../config';
 import logger from './logger';
 
+import { serverMessages as deprecatedServerMessage } from '../deprecated-serverMessages';
+import { serverMessages } from '../serverMessages';
+import { BCHAddressTranslator } from './bchaddresstranslator';
 import { BlockChainExplorer } from './blockchainexplorer';
 import { V8 } from './blockchainexplorers/v8';
 import { ChainService } from './chain/index';
+import { Common } from './common';
 import { ClientError } from './errors/clienterror';
+import { Errors } from './errors/errordefinitions';
 import { FiatRateService } from './fiatrateservice';
 import { Lock } from './lock';
 import { MessageBroker } from './messagebroker';
 import {
   Advertisement,
   Copayer,
+  ExternalServicesConfig,
   INotification,
   ITxProposal,
   IWallet,
@@ -27,35 +37,30 @@ import {
 } from './model';
 import { Storage } from './storage';
 
-const config = require('../config');
 const Uuid = require('uuid');
 const $ = require('preconditions').singleton();
-const deprecatedServerMessage = require('../deprecated-serverMessages');
-const serverMessages = require('../serverMessages');
-const BCHAddressTranslator = require('./bchaddresstranslator');
 const EmailValidator = require('email-validator');
 
-import { Validation } from 'crypto-wallet-core';
 const Bitcore = require('bitcore-lib');
 const Bitcore_ = {
   btc: Bitcore,
   bch: require('bitcore-lib-cash'),
   eth: Bitcore,
+  matic: Bitcore,
   xrp: Bitcore,
   doge: require('bitcore-lib-doge'),
   ltc: require('bitcore-lib-ltc')
 };
 
-const Common = require('./common');
 const Utils = Common.Utils;
 const Constants = Common.Constants;
 const Defaults = Common.Defaults;
-
-const Errors = require('./errors/errordefinitions');
+const Services = Common.Services;
 
 let request = require('request');
 let initialized = false;
 let doNotCheckV8 = false;
+let isMoralisInitialized = false;
 
 let lock;
 let storage;
@@ -67,6 +72,7 @@ let serviceVersion;
 
 interface IAddress {
   coin: string;
+  chain: string;
   network: string;
   address: string;
   hasActivity: boolean;
@@ -85,11 +91,12 @@ export interface IWalletService {
   walletId: string;
   copayerId: string;
   appName: string;
-  appVersion: string;
-  parsedClientVersion: { agent: number; major: number; minor: number };
+  appVersion: { agent?: string; major?: number; minor?: number };
+  parsedClientVersion: { agent?: string; major?: number; minor?: number };
   clientVersion: string;
   copayerIsSupportStaff: boolean;
   copayerIsMarketingStaff: boolean;
+  request: any;
 }
 function boolToNum(x: boolean) {
   return x ? 1 : 0;
@@ -98,7 +105,7 @@ function boolToNum(x: boolean) {
  * Creates an instance of the Bitcore Wallet Service.
  * @constructor
  */
-export class WalletService {
+export class WalletService implements IWalletService {
   lock: any;
   storage: Storage;
   blockchainExplorer: V8;
@@ -110,12 +117,12 @@ export class WalletService {
   walletId: string;
   copayerId: string;
   appName: string;
-  appVersion: string;
-  parsedClientVersion: { agent: string; major: number; minor: number };
+  appVersion: { agent?: string; major?: number; minor?: number };
+  parsedClientVersion: { agent?: string; major?: number; minor?: number };
   clientVersion: string;
   copayerIsSupportStaff: boolean;
   copayerIsMarketingStaff: boolean;
-  request;
+  request: any;
 
   constructor() {
     if (!initialized) {
@@ -209,6 +216,34 @@ export class WalletService {
       }
     };
 
+    // Init Moralis
+    const initMoralis = async cb => {
+      if (!config.moralis || !config.moralis.apiKey) {
+        logger.warn('Moralis missing credentials');
+        return cb();
+      }
+
+      if (!isMoralisInitialized) {
+        try {
+          logger.info('Initializing Moralis...');
+          const API_KEY = config.moralis.apiKey;
+
+          await Moralis.start({
+            apiKey: API_KEY,
+          });
+          logger.info('Moralis initialized successfully!');
+          isMoralisInitialized = true;
+          return cb();
+        } catch (err) {
+          logger.error('Error initializing Moralis: ', err);
+          isMoralisInitialized = false;
+          return cb();
+        }
+      } else {
+        return cb();
+      }
+    };
+
     async.series(
       [
         next => {
@@ -219,13 +254,16 @@ export class WalletService {
         },
         next => {
           initFiatRateService(next);
+        },
+        next => {
+          initMoralis(next);
         }
       ],
       err => {
         lock = opts.lock || new Lock(storage);
 
         if (err) {
-          logger.error('Could not initialize', err);
+          logger.error('Could not initialize: %o', err);
           throw err;
         }
         initialized = true;
@@ -383,6 +421,12 @@ export class WalletService {
     this.lock.runLocked(this.walletId, { waitTime }, cb, task);
   }
   logi(message, ...args) {
+    if (typeof message === 'string' && args.length > 0 && !message.endsWith('%o')) {
+      for (let i = 0; i < args.length; i++) {
+        message += ' %o';
+      }
+    }
+
     if (!this || !this.walletId) {
       return logger.warn(message, ...args);
     }
@@ -392,6 +436,12 @@ export class WalletService {
   }
 
   logw(message, ...args) {
+    if (typeof message === 'string' && args.length > 0 && !message.endsWith('%o')) {
+      for (let i = 0; i < args.length; i++) {
+        message += ' %o';
+      }
+    }
+
     if (!this || !this.walletId) {
       return logger.warn(message, ...args);
     }
@@ -401,6 +451,12 @@ export class WalletService {
   }
 
   logd(message, ...args) {
+    if (typeof message === 'string' && args.length > 0 && !message.endsWith('%o')) {
+      for (let i = 0; i < args.length; i++) {
+        message += ' %o';
+      }
+    }
+
     if (!this || !this.walletId) {
       return logger.verbose(message, ...args);
     }
@@ -464,6 +520,7 @@ export class WalletService {
    * @param {string} opts.pubKey - Public key to verify copayers joining have access to the wallet secret.
    * @param {string} opts.singleAddress[=false] - The wallet will only ever have one address.
    * @param {string} opts.coin[='btc'] - The coin for this wallet (btc, bch, eth, doge, ltc).
+   * @param {string} opts.chain[='btc'] - The chain for this wallet (btc, bch, eth, doge, ltc).
    * @param {string} opts.network[='livenet'] - The Bitcoin network for this wallet.
    * @param {string} opts.account[=0] - BIP44 account number
    * @param {string} opts.usePurpose48 - for Multisig wallet, use purpose=48
@@ -472,7 +529,12 @@ export class WalletService {
   createWallet(opts, cb) {
     let pubKey;
 
-    if (opts.coin === 'bch' && opts.n > 1) {
+    opts.coin = opts.coin || Defaults.COIN;
+    if (!opts.chain) {
+      opts.chain = opts.coin; // chain === coin for stored clients
+    }
+
+    if (opts.chain === 'bch' && opts.n > 1) {
       const version = Utils.parseVersion(this.clientVersion);
       if (version && version.agent === 'bwc') {
         if (version.major < 8 || (version.major === 8 && version.minor < 3)) {
@@ -498,9 +560,8 @@ export class WalletService {
       return cb(new ClientError('Invalid combination of required copayers / total copayers'));
     }
 
-    opts.coin = opts.coin || Defaults.COIN;
-    if (!Utils.checkValueInCollection(opts.coin, Constants.COINS)) {
-      return cb(new ClientError('Invalid coin'));
+    if (!Utils.checkValueInCollection(opts.chain, Constants.CHAINS)) {
+      return cb(new ClientError('Invalid chain'));
     }
 
     opts.network = opts.network || 'livenet';
@@ -511,7 +572,7 @@ export class WalletService {
     const derivationStrategy = Constants.DERIVATION_STRATEGIES.BIP44;
     let addressType = opts.n === 1 ? Constants.SCRIPT_TYPES.P2PKH : Constants.SCRIPT_TYPES.P2SH;
 
-    if (opts.useNativeSegwit) {
+    if (opts.useNativeSegwit && Utils.checkValueInCollection(opts.chain, Constants.NATIVE_SEGWIT_CHAINS)) {
       addressType = opts.n === 1 ? Constants.SCRIPT_TYPES.P2WPKH : Constants.SCRIPT_TYPES.P2WSH;
     }
 
@@ -521,11 +582,13 @@ export class WalletService {
       return cb(new ClientError('Invalid public key'));
     }
 
-    if (opts.n > 1 && !ChainService.supportsMultisig(opts.coin)) {
+    // using coin for simplicity
+    if (opts.n > 1 && !ChainService.supportsMultisig(opts.chain)) {
       return cb(new ClientError('Multisig wallets are not supported for this coin'));
     }
 
-    if (ChainService.isSingleAddress(opts.coin)) {
+    // using coin for simplicity
+    if (ChainService.isSingleAddress(opts.chain)) {
       opts.singleAddress = true;
     }
 
@@ -551,6 +614,7 @@ export class WalletService {
             m: opts.m,
             n: opts.n,
             coin: opts.coin,
+            chain: opts.chain, // chain === coin for stored wallets
             network: opts.network,
             pubKey: pubKey.toString(),
             singleAddress: !!opts.singleAddress,
@@ -587,6 +651,9 @@ export class WalletService {
 
       // only for testing
       if (opts.doNotMigrate) return cb(null, wallet);
+
+      // backwards compatibility
+      if (!wallet.chain) wallet.chain = ChainService.getChain(wallet.coin);
 
       // remove someday...
       logger.info(`Migrating wallet ${wallet.id} to cashAddr`);
@@ -629,7 +696,7 @@ export class WalletService {
           });
         },
         done => {
-          this.storage.fetchAddressByCoin(Defaults.COIN, opts.identifier, (err, address) => {
+          this.storage.fetchAddressByChain(Defaults.CHAIN, opts.identifier, (err, address) => {
             if (address) walletId = address.walletId;
             return done(err);
           });
@@ -842,7 +909,9 @@ export class WalletService {
         txProposalId: txp.id,
         creatorId: txp.creatorId,
         amount: txp.getTotalAmount(),
-        message: txp.message
+        message: txp.message,
+        tokenAddress: txp.tokenAddress,
+        multisigContractAddress: txp.multisigContractAddress
       },
       extraArgs
     );
@@ -852,6 +921,7 @@ export class WalletService {
   _addCopayerToWallet(wallet, opts, cb) {
     const copayer = Copayer.create({
       coin: wallet.coin,
+      chain: wallet.chain, // chain === coin for stored clients
       name: opts.name,
       copayerIndex: wallet.copayers.length,
       xPubKey: opts.xPubKey,
@@ -1003,6 +1073,7 @@ export class WalletService {
    * @param {Object} opts
    * @param {string} opts.walletId - The wallet id.
    * @param {string} opts.coin[='btc'] - The expected coin for this wallet (btc, bch, eth, doge, ltc).
+   * @param {string} opts.chain[='btc'] - The expected chain for this wallet (btc, bch, eth, doge, ltc).
    * @param {string} opts.name - The copayer name.
    * @param {string} opts.xPubKey - Extended Public Key for this copayer.
    * @param {string} opts.requestPubKey - Public Key used to check requests from this copayer.
@@ -1016,11 +1087,14 @@ export class WalletService {
     if (_.isEmpty(opts.name)) return cb(new ClientError('Invalid copayer name'));
 
     opts.coin = opts.coin || Defaults.COIN;
-    if (!Utils.checkValueInCollection(opts.coin, Constants.COINS)) return cb(new ClientError('Invalid coin'));
+    if (!opts.chain) {
+      opts.chain = opts.coin; // chain === coin for stored clients
+    }
+    if (!Utils.checkValueInCollection(opts.chain, Constants.CHAINS)) return cb(new ClientError('Invalid coin'));
 
     let xPubKey;
     try {
-      xPubKey = Bitcore_[opts.coin].HDPublicKey(opts.xPubKey);
+      xPubKey = Bitcore_[opts.chain].HDPublicKey(opts.xPubKey);
     } catch (ex) {
       return cb(new ClientError('Invalid extended public key'));
     }
@@ -1034,7 +1108,7 @@ export class WalletService {
         if (err) return cb(err);
         if (!wallet) return cb(Errors.WALLET_NOT_FOUND);
 
-        if (opts.coin === 'bch' && wallet.n > 1) {
+        if (opts.chain === 'bch' && wallet.n > 1) {
           const version = Utils.parseVersion(this.clientVersion);
           if (version && version.agent === 'bwc') {
             if (version.major < 8 || (version.major === 8 && version.minor < 3)) {
@@ -1070,8 +1144,8 @@ export class WalletService {
           }
         }
 
-        if (opts.coin != wallet.coin) {
-          return cb(new ClientError('The wallet you are trying to join was created for a different coin'));
+        if (opts.chain != wallet.chain) {
+          return cb(new ClientError('The wallet you are trying to join was created for a different chain'));
         }
 
         if (wallet.network != xPubKey.network.name) {
@@ -1112,6 +1186,8 @@ export class WalletService {
    * @param {string} opts.unit - Bitcoin unit used to format amounts in notifications.
    * @param {string} opts.tokenAddresses - Linked token addresses
    * @param {string} opts.multisigEthInfo - Linked multisig eth wallet info
+   * @param {string} opts.maticTokenAddresses - Linked token addresses
+   * @param {string} opts.multisigMaticInfo - Linked multisig eth wallet info
    *
    */
   savePreferences(opts, cb) {
@@ -1150,6 +1226,21 @@ export class WalletService {
             value.every(x => Validation.validateAddress('eth', 'mainnet', x.multisigContractAddress))
           );
         }
+      },
+      {
+        name: 'maticTokenAddresses',
+        isValid(value) {
+          return _.isArray(value) && value.every(x => Validation.validateAddress('matic', 'mainnet', x));
+        }
+      },
+      {
+        name: 'multisigMaticInfo',
+        isValid(value) {
+          return (
+            _.isArray(value) &&
+            value.every(x => Validation.validateAddress('matic', 'mainnet', x.multisigContractAddress))
+          );
+        }
       }
     ];
 
@@ -1169,9 +1260,14 @@ export class WalletService {
     this.getWallet({}, (err, wallet) => {
       if (err) return cb(err);
 
-      if (wallet.coin != 'eth') {
+      if (!Constants.EVM_CHAINS[wallet.chain.toUpperCase()]) {
         opts.tokenAddresses = null;
         opts.multisigEthInfo = null;
+      }
+
+      if (wallet.coin != 'matic') {
+        opts.maticMokenAddresses = null;
+        opts.multisigMaticInfo = null;
       }
 
       this._runLocked(cb, cb => {
@@ -1184,14 +1280,14 @@ export class WalletService {
           });
           const preferences = Preferences.fromObj(_.defaults(newPref, opts, oldPref));
 
-          // merge tokenAddresses
+          // merge eth tokenAddresses
           if (opts.tokenAddresses) {
             oldPref = oldPref || {};
             oldPref.tokenAddresses = oldPref.tokenAddresses || [];
             preferences.tokenAddresses = _.uniq(oldPref.tokenAddresses.concat(opts.tokenAddresses));
           }
 
-          // merge multisigEthInfo
+          // merge eth multisigEthInfo
           if (opts.multisigEthInfo) {
             oldPref = oldPref || {};
             oldPref.multisigEthInfo = oldPref.multisigEthInfo || [];
@@ -1213,6 +1309,34 @@ export class WalletService {
             );
           }
 
+          // merge matic tokenAddresses
+          if (opts.maticTokenAddresses) {
+            oldPref = oldPref || {};
+            oldPref.maticTokenAddresses = oldPref.maticTokenAddresses || [];
+            preferences.maticTokenAddresses = _.uniq(oldPref.maticTokenAddresses.concat(opts.maticTokenAddresses));
+          }
+
+          // merge matic multisigMaticInfo
+          if (opts.multisigMaticInfo) {
+            oldPref = oldPref || {};
+            oldPref.multisigMaticInfo = oldPref.multisigMaticInfo || [];
+
+            preferences.multisigMaticInfo = _.uniq(
+              oldPref.multisigMaticInfo.concat(opts.multisigMaticInfo).reduce((x, y) => {
+                let exists = false;
+                x.forEach(e => {
+                  // add new token addresses linked to the multisig wallet
+                  if (e.multisigContractAddress === y.multisigContractAddress) {
+                    e.maticTokenAddresses = e.maticTokenAddresses || [];
+                    y.maticTokenAddresses = _.uniq(e.maticTokenAddresses.concat(y.maticTokenAddresses));
+                    e = Object.assign(e, y);
+                    exists = true;
+                  }
+                });
+                return exists ? x : [...x, y];
+              }, [])
+            );
+          }
           this.storage.storePreferences(preferences, err => {
             return cb(err);
           });
@@ -1278,7 +1402,7 @@ export class WalletService {
 
   _store(wallet, address, cb, checkSync = false) {
     let stoAddress = _.clone(address);
-    ChainService.addressToStorageTransform(wallet.coin, wallet.network, stoAddress);
+    ChainService.addressToStorageTransform(wallet.chain, wallet.network, stoAddress);
     this.storage.storeAddressAndWallet(wallet, stoAddress, (err, isDuplicate) => {
       if (err) return cb(err);
       this.syncWallet(
@@ -1307,7 +1431,7 @@ export class WalletService {
     const createNewAddress = (wallet, cb) => {
       let address;
       try {
-        address = wallet.createAddress(false);
+        address = wallet.createAddress(!!opts.isChange);
       } catch (e) {
         this.logw('Error creating address', e);
         return cb('Bad xPub');
@@ -1319,7 +1443,7 @@ export class WalletService {
         (err, duplicate) => {
           if (err) return cb(err);
           if (duplicate) return cb(null, address);
-          if (wallet.coin == 'bch' && opts.noCashAddr) {
+          if (wallet.chain == 'bch' && opts.noCashAddr) {
             address = _.cloneDeep(address);
             address.address = BCHAddressTranslator.translate(address.address, 'copay');
           }
@@ -1343,7 +1467,7 @@ export class WalletService {
         if (err) return cb(err);
         if (!_.isEmpty(addresses)) {
           let x = _.head(addresses);
-          ChainService.addressFromStorageTransform(wallet.coin, wallet.network, x);
+          ChainService.addressFromStorageTransform(wallet.chain, wallet.network, x);
           return cb(null, x);
         }
         return createNewAddress(wallet, cb);
@@ -1353,7 +1477,7 @@ export class WalletService {
     this.getWallet({ doNotMigrate: opts.doNotMigrate }, (err, wallet) => {
       if (err) return cb(err);
 
-      if (ChainService.isSingleAddress(wallet.coin)) {
+      if (ChainService.isSingleAddress(wallet.chain)) {
         opts.ignoreMaxGap = true;
         opts.singleAddress = true;
       }
@@ -1404,7 +1528,7 @@ export class WalletService {
 
       this.getWallet({}, (err, wallet) => {
         _.each(onlyMain, x => {
-          ChainService.addressFromStorageTransform(wallet.coin, wallet.network, x);
+          ChainService.addressFromStorageTransform(wallet.chain, wallet.network, x);
         });
         return cb(null, onlyMain);
       });
@@ -1431,27 +1555,30 @@ export class WalletService {
     });
   }
 
-  _getBlockchainExplorer(coin, network): ReturnType<typeof BlockChainExplorer> {
+  _getBlockchainExplorer(chain, network): ReturnType<typeof BlockChainExplorer> {
     let opts: Partial<{
       provider: string;
-      coin: string;
+      chain: string;
       network: string;
       userAgent: string;
     }> = {};
 
     let provider;
 
+    // blockchainExplorerOpts has lowercased fields
+    chain = chain.toLowerCase();
+
     if (this.blockchainExplorer) return this.blockchainExplorer;
     if (this.blockchainExplorerOpts) {
-      if (this.blockchainExplorerOpts[coin] && this.blockchainExplorerOpts[coin][network]) {
-        opts = this.blockchainExplorerOpts[coin][network];
+      if (this.blockchainExplorerOpts[chain] && this.blockchainExplorerOpts[chain][network]) {
+        opts = this.blockchainExplorerOpts[chain][network];
         provider = opts.provider;
       } else if (this.blockchainExplorerOpts[network]) {
         opts = this.blockchainExplorerOpts[network];
       }
     }
     opts.provider = provider;
-    opts.coin = coin;
+    opts.chain = chain;
     opts.network = network;
     opts.userAgent = WalletService.getServiceVersion();
     let bc;
@@ -1470,7 +1597,7 @@ export class WalletService {
       return utxo.txid + '|' + utxo.vout;
     };
 
-    let coin, allAddresses, allUtxos, utxoIndex, addressStrs, bc, wallet;
+    let coin, allAddresses, allUtxos, utxoIndex, addressStrs, bc, wallet, blockchainHeight;
     async.series(
       [
         next => {
@@ -1481,9 +1608,7 @@ export class WalletService {
 
             if (wallet.scanStatus == 'error') return cb(Errors.WALLET_NEED_SCAN);
 
-            coin = wallet.coin;
-
-            bc = this._getBlockchainExplorer(coin, wallet.network);
+            bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
             if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
             return next();
           });
@@ -1497,7 +1622,7 @@ export class WalletService {
           // even with Grouping we need address for pubkeys and path (see last step)
           this.storage.fetchAddresses(this.walletId, (err, addresses) => {
             _.each(addresses, x => {
-              ChainService.addressFromStorageTransform(wallet.coin, wallet.network, x);
+              ChainService.addressFromStorageTransform(wallet.chain, wallet.network, x);
             });
             allAddresses = addresses;
             if (allAddresses.length == 0) return cb(null, []);
@@ -1511,26 +1636,78 @@ export class WalletService {
         },
         next => {
           if (!wallet.isComplete()) return next();
-
-          this._getBlockchainHeight(wallet.coin, wallet.network, (err, height, hash) => {
+          this._getBlockchainHeight(wallet.chain, wallet.network, (err, height, hash) => {
             if (err) return next(err);
-
-            const dustThreshold = Bitcore_[wallet.coin].Transaction.DUST_AMOUNT;
-            bc.getUtxos(wallet, height, (err, utxos) => {
-              if (err) return next(err);
-              if (utxos.length == 0) return cb(null, []);
-
-              // filter out DUST
-              allUtxos = _.filter(utxos, x => {
-                return x.satoshis >= dustThreshold;
-              });
-
-              utxoIndex = _.keyBy(allUtxos, utxoKey);
-              return next();
-            });
+            blockchainHeight = height;
+            next();
           });
         },
         next => {
+          if (!wallet.isComplete()) return next();
+
+          const dustThreshold = Bitcore_[wallet.chain].Transaction.DUST_AMOUNT;
+          const isEscrowPayment = wallet.isZceCompatible() && opts.instantAcceptanceEscrow ? true : false;
+          const replaceTxByFee = opts.replaceTxByFee ? true : false;
+          bc.getUtxos(
+            wallet,
+            blockchainHeight,
+            (err, utxos) => {
+              if (err) return next(err);
+              if (utxos.length == 0) return cb(null, []);
+
+              let unusableAddresses = [];
+              if (isEscrowPayment) {
+                const unusableUtxos = utxos.filter(utxo => utxo.spent || utxo.address.startsWith('p'));
+                unusableAddresses = unusableUtxos.map(utxo => utxo.address);
+              }
+
+              allUtxos = utxos.filter(x => x.satoshis >= dustThreshold && !unusableAddresses.includes(x.address));
+
+              return next();
+            },
+            { includeSpent: isEscrowPayment || replaceTxByFee }
+          );
+        },
+        next => {
+          if (!wallet.isComplete() || !wallet.isZceCompatible()) return next();
+
+          // Ensure no UTXOs which originate from addresses that were recently used to fund a currently
+          // insufficiently confirmed ZCE-secured payment can be used to fund any subsequent transactions
+          // until the ZCE-secured payment (and escrow reclaim tx) receives 11 confirmations.
+          // Rationale: https://github.com/bitjson/bch-zce#wallet-utxo-selection
+
+          const bchRollingBlockCheckpointNumber = 10;
+          const bchReorgSafeBlockHeight = blockchainHeight - bchRollingBlockCheckpointNumber - 1;
+          let lockedAddresses = [];
+          bc.getTransactions(wallet, bchReorgSafeBlockHeight, (err, txs) => {
+            if (err) return next(err);
+            const unconfirmedZceTxs = txs.filter(tx => tx.category === 'move' && tx.address.startsWith('p'));
+            async.each(
+              unconfirmedZceTxs,
+              (tx: any, next) => {
+                this.getCoinsForTx({ txId: tx.txid }, (err, coins) => {
+                  if (err) return next(err);
+                  const inputAddresses = coins.inputs.map(input => input.address);
+                  lockedAddresses = [...lockedAddresses, ...inputAddresses];
+                  return next();
+                });
+              },
+              err => {
+                if (err) return next(err);
+                allUtxos = allUtxos.map(utxo => {
+                  if (lockedAddresses.includes(utxo.address)) {
+                    utxo.locked = true;
+                  }
+                  return utxo;
+                });
+                return next();
+              }
+            );
+          });
+        },
+        next => {
+          utxoIndex = _.keyBy(allUtxos, utxoKey);
+
           this.getPendingTxs({}, (err, txps) => {
             if (err) return next(err);
 
@@ -1559,13 +1736,19 @@ export class WalletService {
             (err, txs) => {
               if (err) return next(err);
               const spentInputs = _.map(_.flatten(_.map(txs, 'inputs')), utxoKey);
+              const txIdArray = _.map(opts.inputs, 'txid');
+
               _.each(spentInputs, input => {
                 if (utxoIndex[input]) {
                   utxoIndex[input].spent = true;
                 }
               });
-              allUtxos = _.reject(allUtxos, {
-                spent: true
+              // except spent inputs of the RBF transaction if it's a replacement
+              allUtxos = _.reject(allUtxos, utxo => {
+                return (
+                  (!opts.replaceTxByFee && utxo.spent) ||
+                  (utxo.spent && opts.replaceTxByFee && !_.includes(txIdArray, utxo.txid))
+                );
               });
               logger.debug(`Got ${allUtxos.length} usable UTXOs`);
               return next();
@@ -1615,13 +1798,13 @@ export class WalletService {
       this.getWallet({}, (err, wallet) => {
         if (err) return cb(err);
 
-        const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+        const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
         if (!bc) {
           return cb(new Error('Could not get blockchain explorer instance'));
         }
 
         const address = opts.addresses[0];
-        const A = Bitcore_[wallet.coin].Address;
+        const A = Bitcore_[wallet.chain].Address;
         let addrObj: { network?: { name?: string } } = {};
         try {
           addrObj = new A(address);
@@ -1632,7 +1815,7 @@ export class WalletService {
           return cb(null, []);
         }
 
-        this._getBlockchainHeight(wallet.coin, wallet.network, (err, height, hash) => {
+        this._getBlockchainHeight(wallet.chain, wallet.network, (err, height, hash) => {
           if (err) return cb(err);
           bc.getAddressUtxos(address, height, (err, utxos) => {
             if (err) return cb(err);
@@ -1655,14 +1838,14 @@ export class WalletService {
    */
   getCoinsForTx(opts, cb) {
     this.getWallet({}, (err, wallet) => {
-      if (!ChainService.isUTXOCoin(wallet.coin)) {
+      if (!ChainService.isUTXOChain(wallet.chain)) {
         // this prevents old BWC clients to break
         return cb(null, {
           inputs: [],
           outputs: []
         });
       }
-      const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+      const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
       if (!bc) {
         return cb(new Error('Could not get blockchain explorer instance'));
       }
@@ -1741,7 +1924,7 @@ export class WalletService {
         opts.feeLevel = 'normal';
       }
 
-      const feeLevels = Defaults.FEE_LEVELS[wallet.coin];
+      const feeLevels = Defaults.FEE_LEVELS[wallet.chain];
       if (opts.feeLevel) {
         if (
           !_.some(feeLevels, {
@@ -1752,7 +1935,7 @@ export class WalletService {
       }
 
       if (_.isNumber(opts.feePerKb)) {
-        if (opts.feePerKb < Defaults.MIN_FEE_PER_KB || opts.feePerKb > Defaults.MAX_FEE_PER_KB[wallet.coin])
+        if (opts.feePerKb < Defaults.MIN_FEE_PER_KB || opts.feePerKb > Defaults.MAX_FEE_PER_KB[wallet.chain])
           return cb(new ClientError('Invalid fee per KB'));
       }
 
@@ -1760,8 +1943,8 @@ export class WalletService {
     });
   }
 
-  _sampleFeeLevels(coin, network, points, cb) {
-    const bc = this._getBlockchainExplorer(coin, network);
+  _sampleFeeLevels(chain, network, points, cb) {
+    const bc = this._getBlockchainExplorer(chain, network);
     if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
     bc.estimateFee(points, (err, result) => {
       if (err) {
@@ -1778,7 +1961,7 @@ export class WalletService {
           // NOTE: ONLY BTC/BCH/DOGE/LTC expect feePerKb to be Bitcoin amounts
           // others... expect wei.
 
-          return ChainService.convertFeePerKb(coin, p, feePerKb);
+          return ChainService.convertFeePerKb(chain, p, feePerKb);
         })
       );
 
@@ -1795,28 +1978,29 @@ export class WalletService {
    * Returns fee levels for the current state of the network.
    * @param {Object} opts
    * @param {string} [opts.coin = 'btc'] - The coin to estimate fee levels from.
+   * @param {string} [opts.chain = 'btc'] - The coin to estimate fee levels from.
    * @param {string} [opts.network = 'livenet'] - The Bitcoin network to estimate fee levels from.
    * @returns {Object} feeLevels - A list of fee levels & associated amount per kB in satoshi.
    */
   getFeeLevels(opts, cb) {
     opts = opts || {};
 
-    opts.coin = opts.coin || Defaults.COIN;
-    if (!Utils.checkValueInCollection(opts.coin, Constants.COINS)) return cb(new ClientError('Invalid coin'));
+    opts.chain = opts.chain || Defaults.CHAIN;
+    if (!Utils.checkValueInCollection(opts.chain, Constants.CHAINS)) return cb(new ClientError('Invalid chain'));
 
     opts.network = opts.network || 'livenet';
     if (!Utils.checkValueInCollection(opts.network, Constants.NETWORKS)) return cb(new ClientError('Invalid network'));
 
-    const cacheKey = 'feeLevel:' + opts.coin + ':' + opts.network;
+    const cacheKey = 'feeLevel:' + opts.chain + ':' + opts.network;
 
     this.storage.checkAndUseGlobalCache(cacheKey, Defaults.FEE_LEVEL_CACHE_DURATION, (err, values, oldvalues) => {
       if (err) return cb(err);
       if (values) return cb(null, values, true);
 
-      const feeLevels = Defaults.FEE_LEVELS[opts.coin];
+      const feeLevels = Defaults.FEE_LEVELS[opts.chain];
 
       /*
-      if (opts.coin === 'doge') {
+      if (opts.chain === 'doge') {
         const defaultDogeFeeLevels = feeLevels[0];
         const result: {
           feePerKb?: number;
@@ -1863,7 +2047,7 @@ export class WalletService {
         return result;
       };
 
-      this._sampleFeeLevels(opts.coin, opts.network, samplePoints(), (err, feeSamples, failed) => {
+      this._sampleFeeLevels(opts.chain, opts.network, samplePoints(), (err, feeSamples, failed) => {
         if (err) {
           if (oldvalues) {
             this.logw('##  There was an error estimating fees... using old cached values');
@@ -1952,11 +2136,11 @@ export class WalletService {
         return new ClientError('Argument missing in output #' + (i + 1) + '.');
       }
 
-      if (!ChainService.checkValidTxAmount(wallet.coin, output)) {
+      if (!ChainService.checkValidTxAmount(wallet.chain, output)) {
         return new ClientError('Invalid amount');
       }
 
-      const error = ChainService.checkDust(wallet.coin, output, opts);
+      const error = ChainService.checkDust(wallet.chain, output, opts);
       if (error) return error;
       output.valid = true;
     }
@@ -1975,7 +2159,7 @@ export class WalletService {
             opts.feeLevel = 'normal';
           }
 
-          const feeLevels = Defaults.FEE_LEVELS[wallet.coin];
+          const feeLevels = Defaults.FEE_LEVELS[wallet.chain];
           if (opts.feeLevel) {
             if (
               !_.some(feeLevels, {
@@ -1987,7 +2171,7 @@ export class WalletService {
               );
           }
 
-          const error = ChainService.checkUtxos(wallet.coin, opts);
+          const error = ChainService.checkUtxos(wallet.chain, opts);
           if (error) {
             return next(new ClientError('fee can only be set when inputs are specified'));
           }
@@ -2026,7 +2210,6 @@ export class WalletService {
           );
         },
         next => {
-          if (opts.validateOutputs === false) return next();
           const validationError = this._validateOutputs(opts, wallet, next);
           if (validationError) {
             return next(validationError);
@@ -2035,7 +2218,7 @@ export class WalletService {
         },
         next => {
           // check outputs are on 'copay' format for BCH
-          if (wallet.coin != 'bch') return next();
+          if (wallet.chain != 'bch') return next();
           if (!opts.noCashAddr) return next();
 
           // TODO remove one cashaddr is used internally (noCashAddr flag)?
@@ -2078,7 +2261,7 @@ export class WalletService {
     if (_.isNumber(opts.feePerKb)) return cb(null, opts.feePerKb);
     this.getFeeLevels(
       {
-        coin: wallet.coin,
+        chain: wallet.chain,
         network: wallet.network
       },
       (err, levels) => {
@@ -2095,7 +2278,7 @@ export class WalletService {
   }
 
   _getTransactionCount(wallet, address, cb) {
-    const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+    const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
     if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
     bc.getTransactionCount(address, (err, nonce) => {
       if (err) {
@@ -2107,7 +2290,7 @@ export class WalletService {
   }
 
   getNonce(opts) {
-    const bc = this._getBlockchainExplorer(opts.coin, opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || opts.coin || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.getTransactionCount(opts.address, (err, nonce) => {
@@ -2121,7 +2304,7 @@ export class WalletService {
   }
 
   estimateGas(opts) {
-    const bc = this._getBlockchainExplorer(opts.coin, opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || opts.coin || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.estimateGas(opts, (err, gasLimit) => {
@@ -2135,7 +2318,7 @@ export class WalletService {
   }
 
   getMultisigContractInstantiationInfo(opts) {
-    const bc = this._getBlockchainExplorer('eth', opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.getMultisigContractInstantiationInfo(opts, (err, contractInstantiationInfo) => {
@@ -2149,7 +2332,7 @@ export class WalletService {
   }
 
   getMultisigContractInfo(opts) {
-    const bc = this._getBlockchainExplorer('eth', opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.getMultisigContractInfo(opts, (err, contractInfo) => {
@@ -2163,7 +2346,7 @@ export class WalletService {
   }
 
   getTokenContractInfo(opts) {
-    const bc = this._getBlockchainExplorer('eth', opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.getTokenContractInfo(opts, (err, contractInfo) => {
@@ -2177,7 +2360,7 @@ export class WalletService {
   }
 
   getMultisigTxpsInfo(opts) {
-    const bc = this._getBlockchainExplorer('eth', opts.network);
+    const bc = this._getBlockchainExplorer(opts.chain || Defaults.EVM_CHAIN, opts.network);
     return new Promise((resolve, reject) => {
       if (!bc) return reject(new Error('Could not get blockchain explorer instance'));
       bc.getMultisigTxpsInfo(opts, (err, multisigTxpsInfo) => {
@@ -2195,6 +2378,7 @@ export class WalletService {
    * @param {Object} opts
    * @param {string} opts.txProposalId - Optional. If provided it will be used as this TX proposal ID. Should be unique in the scope of the wallet.
    * @param {String} opts.coin - tx coin.
+   * @param {String} opts.chain - tx chain.
    * @param {Array} opts.outputs - List of outputs.
    * @param {string} opts.outputs[].toAddress - Destination address.
    * @param {number} opts.outputs[].amount - Amount to transfer in satoshi.
@@ -2206,7 +2390,6 @@ export class WalletService {
    * @param {Boolean} opts.sendMax - Optional. Send maximum amount of funds that make sense under the specified fee/feePerKb conditions. (defaults to false).
    * @param {string} opts.payProUrl - Optional. Paypro URL for peers to verify TX
    * @param {Boolean} opts.excludeUnconfirmedUtxos[=false] - Optional. Do not use UTXOs of unconfirmed transactions as inputs
-   * @param {Boolean} opts.validateOutputs[=true] - Optional. Perform validation on outputs.
    * @param {Boolean} opts.dryRun[=false] - Optional. Simulate the action but do not change server state.
    * @param {Array} opts.inputs - Optional. Inputs for this TX
    * @param {Array} opts.txpVersion - Optional. Version for TX Proposal (current = 4, only =3 allowed).
@@ -2217,6 +2400,8 @@ export class WalletService {
    * @param {string} opts.tokenAddress - optional. ERC20 Token Contract Address
    * @param {string} opts.multisigContractAddress - optional. MULTISIG ETH Contract Address
    * @param {Boolean} opts.isTokenSwap - Optional. To specify if we are trying to make a token swap
+   * @param {Boolean} opts.enableRBF - Optional. enable BTC Replace By Fee
+   * @param {Boolean} opts.replaceTxByFee - Optional. Ignore locked utxos check ( used for replacing a transaction designated as RBF)
    * @returns {TxProposal} Transaction proposal. outputs address format will use the same format as inpunt.
    */
   createTx(opts, cb) {
@@ -2237,9 +2422,9 @@ export class WalletService {
 
           if (wallet.scanStatus == 'error') return cb(Errors.WALLET_NEED_SCAN);
 
-          if (config.suspendedChains && config.suspendedChains.includes(wallet.coin)) {
+          if (config.suspendedChains && config.suspendedChains.includes(wallet.chain)) {
             let Err = Errors.NETWORK_SUSPENDED;
-            Err.message = Err.message.replace('$network', wallet.coin.toUpperCase());
+            Err.message = Err.message.replace('$network', wallet.chain.toUpperCase());
             return cb(Err);
           }
 
@@ -2250,7 +2435,7 @@ export class WalletService {
             async.series(
               [
                 next => {
-                  if (ChainService.isUTXOCoin(wallet.coin)) return next();
+                  if (ChainService.isUTXOChain(wallet.chain)) return next();
                   this.getMainAddresses({ reverse: true, limit: 1 }, (err, mainAddr) => {
                     if (err) return next(err);
                     opts.from = mainAddr[0].address;
@@ -2314,7 +2499,7 @@ export class WalletService {
 
                   if (!txOptsFee) {
                     const useInputFee = opts.inputs && !_.isNumber(opts.feePerKb);
-                    const isNotUtxoCoin = !ChainService.isUTXOCoin(wallet.coin);
+                    const isNotUtxoCoin = !ChainService.isUTXOChain(wallet.chain);
                     const shouldUseOptsFee = useInputFee || isNotUtxoCoin;
 
                     if (shouldUseOptsFee) {
@@ -2327,7 +2512,7 @@ export class WalletService {
                     walletId: this.walletId,
                     creatorId: this.copayerId,
                     coin: opts.coin,
-                    chain: opts.chain ? opts.chain : opts.coin,
+                    chain: opts.chain?.toLowerCase() || ChainService.getChain(opts.coin), // getChain -> backwards compatibility
                     network: wallet.network,
                     outputs: opts.outputs,
                     message: opts.message,
@@ -2339,7 +2524,7 @@ export class WalletService {
                     walletM: wallet.m,
                     walletN: wallet.n,
                     excludeUnconfirmedUtxos: !!opts.excludeUnconfirmedUtxos,
-                    validateOutputs: !opts.validateOutputs,
+                    instantAcceptanceEscrow: opts.instantAcceptanceEscrow,
                     addressType: wallet.addressType,
                     customData: opts.customData,
                     inputs: opts.inputs,
@@ -2352,16 +2537,31 @@ export class WalletService {
                     data: opts.data, // Backward compatibility for BWC < v7.1.1
                     tokenAddress: opts.tokenAddress,
                     multisigContractAddress: opts.multisigContractAddress,
+                    multiSendContractAddress: opts.multiSendContractAddress,
                     destinationTag: opts.destinationTag,
                     invoiceID: opts.invoiceID,
                     signingMethod: opts.signingMethod,
-                    isTokenSwap: opts.isTokenSwap
+                    isTokenSwap: opts.isTokenSwap,
+                    enableRBF: opts.enableRBF,
+                    replaceTxByFee: opts.replaceTxByFee
                   };
                   txp = TxProposal.create(txOpts);
                   next();
                 },
                 next => {
                   return ChainService.selectTxInputs(this, txp, wallet, opts, next);
+                },
+                async next => {
+                  if (!wallet.isZceCompatible() || !opts.instantAcceptanceEscrow) return next();
+                  try {
+                    opts.inputs = txp.inputs;
+                    const escrowAddress = await ChainService.getChangeAddress(this, wallet, opts);
+                    txp.escrowAddress = escrowAddress;
+                  } catch (error) {
+                    return next(error);
+                  }
+                  if (opts.dryRun) return next();
+                  this._store(wallet, txp.escrowAddress, next, true);
                 },
                 next => {
                   if (!changeAddress || wallet.singleAddress || opts.dryRun || opts.changeAddress) return next();
@@ -2412,9 +2612,9 @@ export class WalletService {
       this.getWallet({}, (err, wallet) => {
         if (err) return cb(err);
 
-        if (config.suspendedChains && config.suspendedChains.includes(wallet.coin)) {
+        if (config.suspendedChains && config.suspendedChains.includes(wallet.chain)) {
           let Err = Errors.NETWORK_SUSPENDED;
-          Err.message = Err.message.replace('$network', wallet.coin.toUpperCase());
+          Err.message = Err.message.replace('$network', wallet.chain.toUpperCase());
           return cb(Err);
         }
 
@@ -2597,11 +2797,14 @@ export class WalletService {
     });
   }
 
-  _broadcastRawTx(coin, network, raw, cb) {
-    const bc = this._getBlockchainExplorer(coin, network);
+  _broadcastRawTx(chain, network, raw, cb) {
+    const bc = this._getBlockchainExplorer(chain, network);
     if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
     bc.broadcast(raw, (err, txid) => {
-      if (err) return cb(err);
+      if (err) {
+        logger.info('Error broadcasting tx: %o %o %o %o', chain, network, raw, err);
+        return cb(err);
+      }
       return cb(null, txid);
     });
   }
@@ -2610,24 +2813,25 @@ export class WalletService {
    * Broadcast a raw transaction.
    * @param {Object} opts
    * @param {string} [opts.coin = 'btc'] - The coin for this transaction.
+   * @param {string} [opts.chain = 'btc'] - The coin for this transaction.
    * @param {string} [opts.network = 'livenet'] - The Bitcoin network for this transaction.
    * @param {string} opts.rawTx - Raw tx data.
    */
   broadcastRawTx(opts, cb) {
     if (!checkRequired(opts, ['network', 'rawTx'], cb)) return;
 
-    opts.coin = opts.coin || Defaults.COIN;
-    if (!Utils.checkValueInCollection(opts.coin, Constants.COINS)) return cb(new ClientError('Invalid coin'));
+    opts.chain = opts.chain || opts.coin || Defaults.COIN;
+    if (!Utils.checkValueInCollection(opts.chain, Constants.CHAINS)) return cb(new ClientError('Invalid chain'));
 
     opts.network = opts.network || 'livenet';
     if (!Utils.checkValueInCollection(opts.network, Constants.NETWORKS)) return cb(new ClientError('Invalid network'));
 
-    this._broadcastRawTx(opts.coin, opts.network, opts.rawTx, cb);
+    this._broadcastRawTx(opts.chain, opts.network, opts.rawTx, cb);
   }
 
   _checkTxInBlockchain(txp, cb) {
     if (!txp.txid) return cb();
-    const bc = this._getBlockchainExplorer(txp.coin, txp.network);
+    const bc = this._getBlockchainExplorer(txp.chain, txp.network);
     if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
     bc.getTransaction(txp.txid, (err, tx) => {
       if (err) return cb(err);
@@ -2650,9 +2854,9 @@ export class WalletService {
     this.getWallet({}, (err, wallet) => {
       if (err) return cb(err);
 
-      if (config.suspendedChains && config.suspendedChains.includes(wallet.coin)) {
+      if (config.suspendedChains && config.suspendedChains.includes(wallet.chain)) {
         let Err = Errors.NETWORK_SUSPENDED;
-        Err.message = Err.message.replace('$network', wallet.coin.toUpperCase());
+        Err.message = Err.message.replace('$network', wallet.chain.toUpperCase());
         return cb(Err);
       }
 
@@ -2660,7 +2864,7 @@ export class WalletService {
         {
           txProposalId: opts.txProposalId
         },
-        (err, txp) => {
+        async (err, txp) => {
           if (err) return cb(err);
 
           if (opts.maxTxpVersion < txp.version) {
@@ -2679,6 +2883,19 @@ export class WalletService {
           if (!txp.isPending()) return cb(Errors.TX_NOT_PENDING);
 
           if (txp.signingMethod === 'schnorr' && !opts.supportBchSchnorr) return cb(Errors.UPGRADE_NEEDED);
+
+          if (Constants.EVM_CHAINS[wallet.chain.toUpperCase()]) {
+            try {
+              const txps = await this.getPendingTxsPromise({});
+              for (let t of txps) {
+                if (t.id !== txp.id && t.nonce <= txp.nonce && t.status !== 'rejected') {
+                  return cb(Errors.TX_NONCE_CONFLICT);
+                }
+              }
+            } catch (err) {
+              return cb(err);
+            }
+          }
 
           const copayer = wallet.getCopayer(this.copayerId);
 
@@ -2761,9 +2978,9 @@ export class WalletService {
     this.getWallet({}, (err, wallet) => {
       if (err) return cb(err);
 
-      if (config.suspendedChains && config.suspendedChains.includes(wallet.coin)) {
+      if (config.suspendedChains && config.suspendedChains.includes(wallet.chain)) {
         let Err = Errors.NETWORK_SUSPENDED;
-        Err.message = Err.message.replace('$network', wallet.coin.toUpperCase());
+        Err.message = Err.message.replace('$network', wallet.chain.toUpperCase());
         return cb(Err);
       }
 
@@ -2786,7 +3003,7 @@ export class WalletService {
             isCreator: true
           });
           this.storage.storeTxConfirmationSub(sub, err => {
-            if (err) logger.error('Could not store Tx confirmation subscription: ', err);
+            if (err) logger.error('Could not store Tx confirmation subscription: %o', err);
 
             let raw;
             try {
@@ -2794,13 +3011,9 @@ export class WalletService {
             } catch (ex) {
               return cb(ex);
             }
-            this._broadcastRawTx(wallet.coin, wallet.network, raw, (err, txid) => {
+            this._broadcastRawTx(wallet.chain, wallet.network, raw, (err, txid) => {
               if (err || txid != txp.txid) {
-                if (!err || txp.txid != txid) {
-                  logger.warn(`Broadcast failed for: ${raw}`);
-                } else {
-                  logger.warn(`Broadcast failed: ${err}`);
-                }
+                logger.warn('Broadcast failed: %o %o %o %o %o', wallet.id, wallet.chain, wallet.network, raw, err?.stack || err?.message || err);
 
                 const broadcastErr = err;
                 // Check if tx already in blockchain
@@ -2955,7 +3168,7 @@ export class WalletService {
               return txp.status == 'broadcasted';
             });
 
-            if (txps[0] && txps[0].coin == 'bch') {
+            if (txps[0] && txps[0].chain == 'bch') {
               const format = opts.noCashAddr ? 'copay' : 'cashaddr';
               _.each(txps, x => {
                 if (x.changeAddress) {
@@ -2973,6 +3186,15 @@ export class WalletService {
         );
       });
     }
+  }
+
+  getPendingTxsPromise(opts): Promise<any>  {
+    return new Promise((resolve, reject) => {
+      this.getPendingTxs(opts, (err, txps) => {
+        if (err) return reject(err);
+        return resolve(txps)
+      });
+    });
   }
 
   /**
@@ -3006,7 +3228,7 @@ export class WalletService {
       if (err) return cb(err);
 
       async.map(
-        [`${wallet.coin}:${wallet.network}`, this.walletId],
+        [`${wallet.chain}:${wallet.network}`, this.walletId],
         (walletId, next) => {
           this.storage.fetchNotifications(walletId, opts.notificationId, opts.minTs || 0, next);
         },
@@ -3040,7 +3262,6 @@ export class WalletService {
     const seenReceive = {};
 
     const moves: { [txid: string]: ITxProposal } = {};
-
     // remove 'fees' and 'moves' (probably change addresses)
     txs = _.filter(txs, tx => {
       // double spend or error
@@ -3132,6 +3353,21 @@ export class WalletService {
         _.map([].concat(txs), tx => {
           const t = new Date(tx.blockTime).getTime() / 1000;
           const c = tx.height >= 0 && bcHeight >= tx.height ? bcHeight - tx.height + 1 : 0;
+          
+          // This adapter rebuilds the abiType property from data contained in the effects so that it returns what wallet is used to
+          // If we remove the slight reliance in the wallet on abiType then we can remove this adapter
+          function recreateAbiType(effects) {
+            // Check if any top level effects are ERC20 transfers
+            if (effects && effects.length) {
+              const erc20Transfer = effects.find(e => e.type == 'ERC20:transfer' && e.callStack == '');
+              if (erc20Transfer) {
+                // This is the only data used in old wallet and bitpay-app
+                return { name: 'transfer' };
+              }
+            }
+            return undefined;
+          }
+
           const ret = {
             id: tx.id,
             txid: tx.txid,
@@ -3144,7 +3380,18 @@ export class WalletService {
             action: undefined,
             addressTo: undefined,
             outputs: undefined,
-            dust: false
+            dust: false,
+            error: tx.error,
+            internal: tx.internal,
+            network: tx.network,
+            chain: tx.chain,
+            data: tx.data,
+            abiType: tx.abiType || recreateAbiType(tx.effects),
+            gasPrice: tx.gasPrice,
+            gasLimit: tx.gasLimit,
+            receipt: tx.receipt,
+            nonce: tx.nonce,
+            effects: tx.effects
           };
           switch (tx.category) {
             case 'send':
@@ -3185,8 +3432,8 @@ export class WalletService {
     });
   }
 
-  _getBlockchainHeight(coin, network, cb) {
-    const cacheKey = Storage.BCHEIGHT_KEY + ':' + coin + ':' + network;
+  _getBlockchainHeight(chain, network, cb) {
+    const cacheKey = Storage.BCHEIGHT_KEY + ':' + chain + ':' + network;
 
     this.storage.checkAndUseGlobalCache(cacheKey, Defaults.BLOCKHEIGHT_CACHE_TIME, (err, values) => {
       if (err) return cb(err);
@@ -3195,7 +3442,7 @@ export class WalletService {
 
       values = {};
 
-      const bc = this._getBlockchainExplorer(coin, network);
+      const bc = this._getBlockchainExplorer(chain, network);
       if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
       bc.getBlockchainHeight((err, height, hash) => {
         if (!err && height > 0) {
@@ -3226,7 +3473,7 @@ export class WalletService {
     if (wallet.beRegistered) {
       return cb();
     }
-    const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+    const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
 
     this.logd('Registering wallet');
     bc.register(wallet, err => {
@@ -3266,7 +3513,7 @@ export class WalletService {
           if (isOK) {
             logger.debug('Wallet Sync Check OK');
           } else {
-            logger.warn('ERROR: Wallet check failed:', localCheck, serverCheck);
+            logger.warn('ERROR: Wallet check failed: %o', { localCheck, serverCheck });
             return cb(null, isOK);
           }
 
@@ -3281,7 +3528,7 @@ export class WalletService {
   // Syncs wallet regitration and address with a V8 type blockexplorerer
   syncWallet(wallet, cb, skipCheck?, count?) {
     count = count || 0;
-    const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+    const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
     if (!bc) {
       return cb(new Error('Could not get blockchain explorer instance'));
     }
@@ -3309,7 +3556,7 @@ export class WalletService {
             }
 
             const addressStr = _.map(addresses, x => {
-              ChainService.addressFromStorageTransform(wallet.coin, wallet.network, x);
+              ChainService.addressFromStorageTransform(wallet.chain, wallet.network, x);
               return x.address;
             });
 
@@ -3685,7 +3932,7 @@ export class WalletService {
 
     this.getFeeLevels(
       {
-        coin: wallet.coin,
+        chain: wallet.chain,
         network: wallet.network
       },
       (err, levels) => {
@@ -3738,7 +3985,7 @@ export class WalletService {
           this.syncWallet(wallet, next, true);
         },
         next => {
-          this._getBlockchainHeight(wallet.coin, wallet.network, (err, height, hash) => {
+          this._getBlockchainHeight(wallet.chain, wallet.network, (err, height, hash) => {
             if (err) return next(err);
             bcHeight = height;
             bcHash = hash;
@@ -3756,7 +4003,7 @@ export class WalletService {
         next => {
           if (skip == 0 || !streamKey) return next();
 
-          logger.debug('Checking streamKey/skip', streamKey, skip);
+          logger.debug('Checking streamKey/skip %o', { streamKey, skip });
           this.storage.getTxHistoryStreamV8(walletCacheKey, (err, result) => {
             if (err) return next(err);
             if (!result) return next();
@@ -3778,11 +4025,11 @@ export class WalletService {
           }
 
           const startBlock = cacheStatus.updatedHeight || 0;
-          logger.debug(' ########### GET HISTORY v8 startBlock/bcH]', startBlock, bcHeight); // TODO
+          logger.debug(' ########### GET HISTORY v8 startBlock/bcH] %o', { startBlock, bcHeight });
 
           bc.getTransactions(wallet, startBlock, (err, txs) => {
             if (err) return cb(err);
-            const dustThreshold = ChainService.getDustAmountValue(wallet.coin);
+            const dustThreshold = ChainService.getDustAmountValue(wallet.chain);
             this._normalizeTxHistory(walletCacheKey, txs, dustThreshold, bcHeight, (err, inTxs: any[]) => {
               if (err) return cb(err);
 
@@ -3865,8 +4112,13 @@ export class WalletService {
           // We have now TXs from 'tipHeight` to end in `lastTxs`.
           // Store hard confirmed TXs
           // confirmations here is bcHeight - tip + 1, so OK.
+          let CONFIRMATIONS_TO_START_CACHING = Defaults.CONFIRMATIONS_TO_START_CACHING;
+          if (Constants.CONFIRMATIONS_TO_START_CACHING[wallet.chain] != null) {
+            CONFIRMATIONS_TO_START_CACHING = Constants.CONFIRMATIONS_TO_START_CACHING[wallet.chain];
+          }
+
           txsToCache = _.filter(lastTxs, i => {
-            if (i.confirmations < Defaults.CONFIRMATIONS_TO_START_CACHING) {
+            if (i.confirmations < CONFIRMATIONS_TO_START_CACHING) {
               return false;
             }
             if (!cacheStatus.tipHeight) return true;
@@ -3879,7 +4131,7 @@ export class WalletService {
             return next();
           }
 
-          const updateHeight = bcHeight - Defaults.CONFIRMATIONS_TO_START_CACHING;
+          const updateHeight = bcHeight - CONFIRMATIONS_TO_START_CACHING;
           this.storage.storeTxHistoryCacheV8(walletCacheKey, cacheStatus.tipIndex, txsToCache, updateHeight, next);
         }
       ],
@@ -3923,7 +4175,7 @@ export class WalletService {
 
       if (wallet.scanStatus == 'running') return cb(Errors.WALLET_BUSY);
 
-      bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+      bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
       if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
 
       const from = opts.skip || 0;
@@ -4034,18 +4286,33 @@ export class WalletService {
       }
 
       this.storage.clearWalletCache(this.walletId, () => {
-        // single address or non UTXO coins do not scan.
-        if (wallet.singleAddress) return cb();
-        if (!ChainService.isUTXOCoin(wallet.coin)) return cb();
+        // do not scan single address UTXO wallets.
+        if (wallet.singleAddress && ChainService.isUTXOChain(wallet.chain)) return cb();
 
         this._runLocked(cb, cb => {
           wallet.scanStatus = 'running';
           this.storage.storeWallet(wallet, err => {
             if (err) return cb(err);
 
-            const bc = this._getBlockchainExplorer(wallet.coin, wallet.network);
+            const bc = this._getBlockchainExplorer(wallet.chain, wallet.network);
             if (!bc) return cb(new Error('Could not get blockchain explorer instance'));
             opts.bc = bc;
+
+            const scanComplete = error => {
+              this.storage.fetchWallet(wallet.id, (err, wallet) => {
+                if (err) return cb(err);
+                wallet.scanStatus = error ? 'error' : 'success';
+                this.storage.storeWallet(wallet, err => {
+                  return cb(error || err);
+                });
+              });
+            };
+
+            if (!ChainService.isUTXOChain(wallet.chain)) {
+              // non-UTXO chain "scan" is just a resync
+              return this.syncWallet(wallet, scanComplete);
+            }
+
             let step = opts.startingStep;
             async.doWhilst(
               next => {
@@ -4055,7 +4322,7 @@ export class WalletService {
                 step = step / 10;
                 return step >= 1;
               },
-              cb
+              scanComplete
             );
           });
         });
@@ -4146,15 +4413,7 @@ export class WalletService {
           this._store(wallet, addresses, next);
         });
       },
-      error => {
-        this.storage.fetchWallet(wallet.id, (err, wallet) => {
-          if (err) return cb(err);
-          wallet.scanStatus = error ? 'error' : 'success';
-          this.storage.storeWallet(wallet, err => {
-            return cb(error || err);
-          });
-        });
-      }
+      cb
     );
   }
 
@@ -4180,9 +4439,8 @@ export class WalletService {
       if (err) return cb(err);
       if (!wallet.isComplete()) return cb(Errors.WALLET_NOT_COMPLETE);
 
-      // single address or non UTXO coins do not scan.
-      if (wallet.singleAddress) return cb();
-      if (!ChainService.isUTXOCoin(wallet.coin)) return cb();
+      // do not scan single address UTXO wallets.
+      if (wallet.singleAddress && ChainService.isUTXOChain(wallet.chain)) return cb();
 
       setTimeout(() => {
         wallet.beRegistered = false;
@@ -4289,6 +4547,28 @@ export class WalletService {
   }
 
   /**
+   * Subscribe this copayer to the Push Notifications service using the specified token.
+   * @param {Object} opts
+   * @param {string} opts.externalUserId - The token representing the app/device. - Braze
+   * @param {string} [opts.packageName] - The restricted_package_name option associated with this token.
+   * @param {string} [opts.platform] - The platform associated with this token.
+   * @param {string} [opts.walletId] - The walletId associated with this token.
+   */
+  pushNotificationsBrazeSubscribe(opts, cb) {
+    if (!checkRequired(opts, ['externalUserId'], cb)) return;
+
+    const sub = PushNotificationSub.create({
+      copayerId: this.copayerId,
+      externalUserId: opts.externalUserId,
+      packageName: opts.packageName,
+      platform: opts.platform,
+      walletId: opts.walletId
+    });
+
+    this.storage.storePushNotificationBrazeSub(sub, cb);
+  }
+
+  /**
    * Unsubscribe this copayer to the Push Notifications service using the specified token.
    * @param {Object} opts
    * @param {string} opts.token - The token representing the app/device.
@@ -4297,6 +4577,17 @@ export class WalletService {
     if (!checkRequired(opts, ['token'], cb)) return;
 
     this.storage.removePushNotificationSub(this.copayerId, opts.token, cb);
+  }
+
+  /**
+   * Unsubscribe this copayer to the Push Notifications service using the specified token.
+   * @param {Object} opts
+   * @param {string} opts.externalUserId - The token representing the app/device. // Braze
+   */
+  pushNotificationsBrazeUnsubscribe(opts, cb) {
+    if (!checkRequired(opts, ['externalUserId'], cb)) return;
+
+    this.storage.removePushNotificationBrazeSub(this.copayerId, opts.externalUserId, cb);
   }
 
   /**
@@ -4329,19 +4620,850 @@ export class WalletService {
     this.storage.removeTxConfirmationSub(this.copayerId, opts.txid, cb);
   }
 
-  getServicesData(cb) {
-    const data = config.services ?? {};
-    return cb(null, data);
+  /**
+   * Get External Services configuration based on the users location and their current version of the app
+   * @param {Object} opts
+   * @param {string} opts.currentAppVersion - (Optional) The version of the app from which the user is connected.
+   * @param {string} opts.currentLocationCountry - (Optional) Country where the user is currently located.
+   * @param {string} opts.currentLocationState - (Optional) State where the user is currently located.
+   * @param {string} opts.bitpayIdLocationCountry - (Optional) Country registered as address of the user logged in with BitpayId.
+   * @param {string} opts.bitpayIdLocationState - (Optional) State registered as address of the user logged in with BitpayId.
+   * @param {Object} opts.platform - (Optional) Operating system and version of the user's device.
+   */
+  getServicesData(opts, cb) {
+    let externalServicesConfig: ExternalServicesConfig = _.cloneDeep(config.services);
+
+    const isLoggedIn = !!opts?.bitpayIdLocationCountry;
+
+    // Swap crypto rules
+    const swapUsaBannedStates = ['HI', 'LA', 'NY'];
+
+    if (
+      // Logged in with bitpayId
+      (['US', 'USA'].includes(opts?.bitpayIdLocationCountry?.toUpperCase()) && swapUsaBannedStates.includes(opts?.bitpayIdLocationState?.toUpperCase())) ||
+      // Logged out (IP restriction)
+      (!isLoggedIn && ['US', 'USA'].includes(opts?.currentLocationCountry?.toUpperCase()) && swapUsaBannedStates.includes(opts?.currentLocationState?.toUpperCase()))
+    ) {
+      externalServicesConfig.swapCrypto = {...externalServicesConfig.swapCrypto, ...{ disabled: true, disabledMessage:'Swaps are currently unavailable in your area.'}};
+    }
+
+    if (opts?.platform?.os === 'ios' && opts?.currentAppVersion === '14.11.5') {
+      externalServicesConfig.swapCrypto = {...externalServicesConfig.swapCrypto, ...{ disabled: true, disabledTitle:'Unavailable', disabledMessage:'Swaps are currently unavailable in your area.'}};
+    }
+
+    // Buy crypto rules
+    const buyCryptoUsaBannedStates = ['NY'];
+    if (
+      // Logged in with bitpayId
+      (['US', 'USA'].includes(opts?.bitpayIdLocationCountry?.toUpperCase()) && buyCryptoUsaBannedStates.includes(opts?.bitpayIdLocationState?.toUpperCase())) ||
+      // Logged out (IP restriction)
+      (!isLoggedIn && ['US', 'USA'].includes(opts?.currentLocationCountry?.toUpperCase()) && buyCryptoUsaBannedStates.includes(opts?.currentLocationState?.toUpperCase()))
+    ) {
+      externalServicesConfig.buyCrypto = {...externalServicesConfig.buyCrypto, ...{ disabled: true, disabledTitle:'Unavailable', disabledMessage:'This service is currently unavailable in your area.'}};
+    }
+
+    return cb(null, externalServicesConfig);
   }
 
-  simplexGetKeys(req) {
-    if (!config.simplex) throw new Error('Simplex missing credentials');
+  private banxaGetKeys(req) {
+    if (!config.banxa) throw new Error('Banxa missing credentials');
 
-    let env = 'sandbox';
-    if (req.body.env && req.body.env == 'production') {
-      env = 'production';
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
+    }
+
+    delete req.body.env;
+    delete req.body.context;
+
+    const keys: {
+      API: string;
+      API_KEY: string;
+      SECRET_KEY: string;
+    } = {
+      API: config.banxa[env].api,
+      API_KEY: config.banxa[env].apiKey,
+      SECRET_KEY: config.banxa[env].secretKey
+    };
+
+    return keys;
+  }
+
+  private getBanxaSignature(method: 'get' | 'post', endpoint: string, apiKey: string, secret: string, body?: string) {
+    let signature, auth: string
+    const nonce = Date.now().toString();
+
+    switch (method) {
+      case 'get':
+        signature = 'GET' + '\n' + `/api${endpoint}` + '\n' + nonce;
+        break;
+      case 'post':
+        const stringifiedBody = body ? JSON.stringify(_.cloneDeep(body)) : '';
+        signature = 'POST' + '\n' + `/api${endpoint}` + '\n' + nonce + '\n' + stringifiedBody;
+        break;
+      default:
+        signature = undefined;
+        break;
+    }
+
+    const localSignature = crypto.createHmac('sha256', secret).update(signature).digest('hex');
+    auth = `${apiKey}:${localSignature}:${nonce}`
+    return auth;
+  }
+
+  banxaGetPaymentMethods(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.banxaGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      let qs = [];
+      if (req.body.source) qs.push('source=' + req.body.source);
+      if (req.body.target) qs.push('target=' + req.body.target);
+
+      const UriPath = `/payment-methods${qs.length > 0 ? '?' + qs.join('&') : ''}`;
+      const URL: string = API + UriPath;
+      const auth = this.getBanxaSignature('get', UriPath, API_KEY, SECRET_KEY);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${auth}`
+      };
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  banxaGetQuote(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.banxaGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['source', 'target'])) {
+        return reject(new ClientError("Banxa's request missing arguments"));
+      }
+
+      let qs = [];
+      qs.push('source=' + req.body.source);
+      qs.push('target=' + req.body.target);
+
+      if (req.body.source_amount) qs.push('source_amount=' + req.body.source_amount);
+      if (req.body.target_amount) qs.push('target_amount=' + req.body.target_amount);
+      if (req.body.payment_method_id) qs.push('payment_method_id=' + req.body.payment_method_id);
+      if (req.body.account_reference) qs.push('account_reference=' + req.body.account_reference);
+      if (req.body.blockchain) qs.push('blockchain=' + req.body.blockchain);
+      
+      const UriPath = `/prices${qs.length > 0 ? '?' + qs.join('&') : ''}`;
+      const URL: string = API + UriPath;
+      const auth = this.getBanxaSignature('get', UriPath, API_KEY, SECRET_KEY);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${auth}`
+      };
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  banxaCreateOrder(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.banxaGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['account_reference', 'source', 'target', 'wallet_address', 'return_url_on_success'])) {
+        return reject(new ClientError("Banxa's request missing arguments"));
+      }
+
+      delete req.body.payment_method_id;
+      
+      const UriPath = '/orders';
+      const URL: string = API + UriPath;
+      const auth = this.getBanxaSignature('post', UriPath, API_KEY, SECRET_KEY, req.body);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${auth}`
+      };
+
+      this.request.post(
+        URL,
+        {
+          headers,
+          body: req.body,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  banxaGetOrder(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.banxaGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['order_id'])) {
+        return reject(new ClientError("Banxa's request missing arguments"));
+      }
+
+      let qs = [];
+      if (req.body.fx_currency) qs.push('fx_currency=' + req.body.fx_currency);
+
+      const UriPath = `/orders/${req.body.order_id}${qs.length > 0 ? '?' + qs.join('&') : ''}`;
+      const URL: string = API + UriPath;
+      const auth = this.getBanxaSignature('get', UriPath, API_KEY, SECRET_KEY);
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${auth}`
+      };
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  private moonpayGetKeys(req) {
+    if (!config.moonpay) throw new Error('Moonpay missing credentials');
+
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
+    }
+
+    delete req.body.env;
+    delete req.body.context;
+
+    const keys: {
+      API: string;
+      WIDGET_API: string;
+      API_KEY: string;
+      SECRET_KEY: string;
+    } = {
+      API: config.moonpay[env].api,
+      WIDGET_API: config.moonpay[env].widgetApi,
+      API_KEY: config.moonpay[env].apiKey,
+      SECRET_KEY: config.moonpay[env].secretKey
+    };
+
+    return keys;
+  }
+
+  moonpayGetQuote(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.moonpayGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      if (!checkRequired(req.body, ['currencyAbbreviation', 'baseCurrencyAmount', 'baseCurrencyCode'])) {
+        return reject(new ClientError("Moonpay's request missing arguments"));
+      }
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      let qs = [];
+      qs.push('apiKey=' + API_KEY);
+      qs.push('baseCurrencyAmount=' + req.body.baseCurrencyAmount);
+      qs.push('baseCurrencyCode=' + req.body.baseCurrencyCode);
+
+      if (req.body.extraFeePercentage) qs.push('extraFeePercentage=' + req.body.extraFeePercentage);
+      if (req.body.paymentMethod) qs.push('paymentMethod=' + req.body.paymentMethod);
+      if (req.body.areFeesIncluded) qs.push('areFeesIncluded=' + req.body.areFeesIncluded);
+
+      const URL: string = API + `/v3/currencies/${req.body.currencyAbbreviation}/buy_quote/?${qs.join('&')}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  moonpayGetCurrencyLimits(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.moonpayGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      if (!checkRequired(req.body, ['currencyAbbreviation', 'baseCurrencyCode'])) {
+        return reject(new ClientError("Moonpay's request missing arguments"));
+      }
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      let qs = [];
+      qs.push('apiKey=' + API_KEY);
+      qs.push('baseCurrencyCode=' + encodeURIComponent(req.body.baseCurrencyCode));
+      if (req.body.areFeesIncluded) qs.push('areFeesIncluded=' + encodeURIComponent(req.body.areFeesIncluded));
+      if (req.body.paymentMethod) qs.push('paymentMethod=' + encodeURIComponent(req.body.paymentMethod));
+
+      const URL = API + `/v3/currencies/${req.body.currencyAbbreviation}/limits/?${qs.join('&')}`
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  moonpayGetSignedPaymentUrl(req): { urlWithSignature: string } {
+    const keys = this.moonpayGetKeys(req);
+    const SECRET_KEY = keys.SECRET_KEY;
+    const API_KEY = keys.API_KEY;
+    const WIDGET_API = keys.WIDGET_API;
+
+    if (
+      !checkRequired(req.body, [
+        'currencyCode',
+        'walletAddress',
+        'baseCurrencyCode',
+        'baseCurrencyAmount',
+        'externalTransactionId',
+        'redirectURL'
+      ])
+    ) {
+      throw new ClientError("Moonpay's request missing arguments");
+    }
+
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+
+    let qs = [];
+    qs.push('apiKey=' + API_KEY);
+    qs.push('currencyCode=' + encodeURIComponent(req.body.currencyCode));
+    qs.push('walletAddress=' + encodeURIComponent(req.body.walletAddress));
+    qs.push('baseCurrencyCode=' + encodeURIComponent(req.body.baseCurrencyCode));
+    qs.push('baseCurrencyAmount=' + encodeURIComponent(req.body.baseCurrencyAmount));
+    qs.push('externalTransactionId=' + encodeURIComponent(req.body.externalTransactionId));
+    qs.push('redirectURL=' + encodeURIComponent(req.body.redirectURL));
+    if (req.body.lockAmount) qs.push('lockAmount=' + encodeURIComponent(req.body.lockAmount));
+    if (req.body.showWalletAddressForm)
+      qs.push('showWalletAddressForm=' + encodeURIComponent(req.body.showWalletAddressForm));
+    if (req.body.paymentMethod) qs.push('paymentMethod=' + encodeURIComponent(req.body.paymentMethod));
+
+    const URL_SEARCH: string = `?${qs.join('&')}`;
+
+    const URLSignatureHash: string = Bitcore.crypto.Hash.sha256hmac(
+      Buffer.from(URL_SEARCH),
+      Buffer.from(SECRET_KEY)
+    ).toString('base64');
+
+    const urlWithSignature = `${WIDGET_API}${URL_SEARCH}&signature=${encodeURIComponent(URLSignatureHash)}`;
+
+    return { urlWithSignature };
+  }
+
+  moonpayGetTransactionDetails(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.moonpayGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      if (!checkRequired(req.body, ['transactionId']) && !checkRequired(req.body, ['externalId'])) {
+        return reject(new ClientError("Moonpay's request missing arguments"));
+      }
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+      let URL: string;
+
+      let qs = [];
+      qs.push('apiKey=' + API_KEY);
+      if (req.body.transactionId) {
+        URL = API + `/v1/transactions/${req.body.transactionId}?${qs.join('&')}`;
+      } else if (req.body.externalId) {
+        URL = API + `/v1/transactions/ext/${req.body.externalId}?${qs.join('&')}`;
+      }
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  moonpayGetAccountDetails(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.moonpayGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      let qs = [];
+      qs.push('apiKey=' + API_KEY);
+
+      const URL = API + `/v3/accounts/me?${qs.join('&')}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  private rampGetKeys(req) {
+    if (!config.ramp) throw new Error('Ramp missing credentials');
+
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
     }
     delete req.body.env;
+    delete req.body.context;
+
+    const keys: {
+      API: string;
+      WIDGET_API: string;
+      API_KEY: string;
+    } = {
+      API: config.ramp[env].api,
+      WIDGET_API: config.ramp[env].widgetApi,
+      API_KEY: config.ramp[env].apiKey,
+    };
+
+    return keys;
+  }
+
+  rampGetQuote(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.rampGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      if (!checkRequired(req.body, ['cryptoAssetSymbol', 'fiatValue', 'fiatCurrency'])) {
+        return reject(new ClientError("Ramp's request missing arguments"));
+      }
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+
+      const URL: string = API + `/host-api/v3/onramp/quote/all?hostApiKey=${API_KEY}`;
+
+      this.request.post(
+        URL,
+        {
+          headers,
+          body: req.body,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  rampGetSignedPaymentUrl(req): { urlWithSignature: string } {
+    const webRequiredParams = [
+      'swapAsset',
+      'userAddress',
+      'selectedCountryCode',
+      'finalUrl',
+    ];
+    const appRequiredParams = [
+      'swapAsset',
+      'swapAmount',
+      'enabledFlows',
+      'defaultFlow',
+      'userAddress',
+      'selectedCountryCode',
+      'defaultAsset',
+      'finalUrl',
+    ];
+
+    const requiredParams = req.body.context === 'web' ? webRequiredParams : appRequiredParams;
+    const keys = this.rampGetKeys(req);
+    const API_KEY = keys.API_KEY;
+    const WIDGET_API = keys.WIDGET_API;
+
+    if (
+      !checkRequired(req.body, requiredParams)
+    ) {
+      throw new ClientError("Ramp's request missing arguments");
+    }
+
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+
+    let qs = [];
+    qs.push('hostApiKey=' + API_KEY);
+    qs.push('swapAsset=' + encodeURIComponent(req.body.swapAsset));
+    qs.push('userAddress=' + encodeURIComponent(req.body.userAddress));
+    qs.push('selectedCountryCode=' + encodeURIComponent(req.body.selectedCountryCode));
+    qs.push('finalUrl=' + encodeURIComponent(req.body.finalUrl));
+    if (req.body.enabledFlows) qs.push('enabledFlows=' + encodeURIComponent(req.body.enabledFlows));
+    if (req.body.defaultFlow) qs.push('defaultFlow=' + encodeURIComponent(req.body.defaultFlow));
+    if (req.body.hostLogoUrl) qs.push('hostLogoUrl=' + encodeURIComponent(req.body.hostLogoUrl));
+    if (req.body.hostAppName) qs.push('hostAppName=' + encodeURIComponent(req.body.hostAppName));
+    if (req.body.swapAmount) qs.push('swapAmount=' + encodeURIComponent(req.body.swapAmount));
+    if (req.body.fiatValue) qs.push('fiatValue=' + encodeURIComponent(req.body.fiatValue));
+    if (req.body.fiatCurrency) qs.push('fiatCurrency=' + encodeURIComponent(req.body.fiatCurrency));
+    if (req.body.defaultAsset) qs.push('defaultAsset=' + encodeURIComponent(req.body.defaultAsset));
+    if (req.body.userEmailAddress) qs.push('userEmailAddress=' + encodeURIComponent(req.body.userEmailAddress));
+
+    const URL_SEARCH: string = `?${qs.join('&')}`;
+
+    const urlWithSignature = `${WIDGET_API}${URL_SEARCH}`;
+
+    return { urlWithSignature };
+  }
+
+  rampGetAssets(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.rampGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+      let URL: string;
+
+      let qs = [];
+      qs.push('hostApiKey=' + API_KEY);
+    if (req.body.currencyCode) qs.push('currencyCode=' + encodeURIComponent(req.body.currencyCode));
+    if (req.body.withDisabled) qs.push('withDisabled=' + encodeURIComponent(req.body.withDisabled));
+    if (req.body.withHidden) qs.push('withHidden=' + encodeURIComponent(req.body.withHidden));
+    if (req.body.useIp) {
+      const ip = Utils.getIpFromReq(req);
+      qs.push('userIp=' + encodeURIComponent(ip));
+    }
+
+      URL = API + `/host-api/v3/assets?${qs.join('&')}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  private sardineGetKeys(req) {
+    if (!config.sardine) throw new Error('Sardine missing credentials');
+
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
+    }
+    delete req.body.env;
+    delete req.body.context;
+
+    const keys: {
+      API: string;
+      SECRET_KEY: string;
+      CLIENT_ID: string;
+    } = {
+      API: config.sardine[env].api,
+      SECRET_KEY: config.sardine[env].secretKey,
+      CLIENT_ID: config.sardine[env].clientId,
+    };
+
+    return keys;
+  }
+
+  sardineGetQuote(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.sardineGetKeys(req);
+      const API = keys.API;
+      const CLIENT_ID = keys.CLIENT_ID;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['asset_type', 'network', 'total'])) {
+        return reject(new ClientError("Sardine's request missing arguments"));
+      }
+
+      const secret = `${CLIENT_ID}:${SECRET_KEY}`;
+      const secretBase64 = Buffer.from(secret).toString('base64');
+
+      const headers = {
+        Accept: 'application/json',
+        Authorization: `Basic ${secretBase64}`,
+      };
+
+      let qs = [];
+      qs.push('asset_type=' + req.body.asset_type);
+      qs.push('network=' + req.body.network);
+      qs.push('total=' + req.body.total);
+
+      if (req.body.currency) qs.push('currency=' + req.body.currency);
+      if (req.body.paymentType) qs.push('paymentType=' + req.body.paymentType);
+      if (req.body.quote_type) qs.push('quote_type=' + req.body.quote_type);
+
+      const URL: string = API + `/v1/quotes?${qs.join('&')}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  sardineGetCurrencyLimits(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.sardineGetKeys(req);
+      const API = keys.API;
+      const CLIENT_ID = keys.CLIENT_ID;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      const secret = `${CLIENT_ID}:${SECRET_KEY}`;
+      const secretBase64 = Buffer.from(secret).toString('base64');
+
+      const headers = {
+        Accept: 'application/json',
+        Authorization: `Basic ${secretBase64}`,
+      };
+
+      const URL: string = API + '/v1/fiat-currencies';
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  sardineGetToken(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.sardineGetKeys(req);
+      const API = keys.API;
+      const CLIENT_ID = keys.CLIENT_ID;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['referenceId', 'externalUserId', 'customerId'])) {
+        return reject(new ClientError("Sardine's request missing arguments"));
+      }
+
+      const secret = `${CLIENT_ID}:${SECRET_KEY}`;
+      const secretBase64 = Buffer.from(secret).toString('base64');
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Basic ${secretBase64}`,
+      };
+
+      const URL: string = API + '/v1/auth/client-tokens';
+
+      this.request.post(
+        URL,
+        {
+          headers,
+          body: req.body,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  sardineGetOrdersDetails(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.sardineGetKeys(req);
+      const API = keys.API;
+      const CLIENT_ID = keys.CLIENT_ID;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      if (!checkRequired(req.body, ['orderId']) && !checkRequired(req.body, ['externalUserId']) && !checkRequired(req.body, ['referenceId'])) {
+        return reject(new ClientError("Sardine's request missing arguments"));
+      }
+
+      const secret = `${CLIENT_ID}:${SECRET_KEY}`;
+      const secretBase64 = Buffer.from(secret).toString('base64');
+
+      const headers = {
+        Accept: 'application/json',
+        Authorization: `Basic ${secretBase64}`,
+      };
+
+      let qs = [];
+      let URL: string;
+
+      if (req.body.orderId) {
+        URL = API + `/v1/orders/${req.body.orderId}`;
+      } else if (req.body.externalUserId || req.body.referenceId){
+        if (req.body.externalUserId) qs.push('externalUserId=' + req.body.externalUserId);
+        if (req.body.referenceId) qs.push('referenceId=' + req.body.referenceId);
+        if (req.body.startDate) qs.push('startDate=' + req.body.startDate);
+        if (req.body.endDate) qs.push('endDate=' + req.body.endDate);
+        if (req.body.limit) qs.push('limit=' + req.body.limit);
+
+        URL = API + `/v1/orders?${qs.join('&')}`;
+      }
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  private simplexGetKeys(req) {
+    if (!config.simplex) throw new Error('Simplex missing credentials');
+
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
+    }
+
+    delete req.body.env;
+    delete req.body.context;
 
     const keys = {
       API: config.simplex[env].api,
@@ -4477,7 +5599,7 @@ export class WalletService {
     });
   }
 
-  wyreGetKeys(req) {
+  private wyreGetKeys(req) {
     if (!config.wyre) throw new Error('Wyre missing credentials');
 
     let env = 'sandbox';
@@ -4495,6 +5617,291 @@ export class WalletService {
 
     return keys;
   }
+
+  private transakGetKeys(req) {
+    if (!config.transak) throw new Error('Transak missing credentials');
+
+    let env: 'sandbox' | 'production' | 'sandboxWeb' | 'productionWeb';
+    env = req.body.env === 'production' ? 'production' : 'sandbox';
+    if (req.body.context === 'web') {
+      env += 'Web';
+    }
+
+    delete req.body.env;
+    delete req.body.context;
+
+    const keys: {
+      API: string;
+      API_KEY: string;
+      SECRET_KEY: string;
+      WIDGET_API: string;
+    } = {
+      API: config.transak[env].api,
+      API_KEY: config.transak[env].apiKey,
+      SECRET_KEY: config.transak[env].secretKey,
+      WIDGET_API: config.transak[env].widgetApi
+    };
+
+    return keys;
+  }
+
+  transakGetAccessToken(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.transakGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+      const SECRET_KEY = keys.SECRET_KEY;
+
+      const headers = {
+        'Content-Type': 'application/json',
+        'api-secret': SECRET_KEY,
+      };
+
+      req.body = {
+        apiKey: API_KEY
+      }
+
+      const URL: string = API + '/partners/api/v2/refresh-token';
+
+      this.request.post(
+        URL,
+        {
+          headers,
+          body: req.body,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  transakGetCryptoCurrencies(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.transakGetKeys(req);
+      const API = keys.API;
+
+      const headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      };
+
+      const URL: string = API + '/api/v2/currencies/crypto-currencies';
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  transakGetFiatCurrencies(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.transakGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      const headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      };
+
+      const URL: string = API + `/api/v2/currencies/fiat-currencies?apiKey=${API_KEY}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  transakGetQuote(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const keys = this.transakGetKeys(req);
+      const API = keys.API;
+      const API_KEY = keys.API_KEY;
+
+      if (!checkRequired(req.body, ['fiatCurrency', 'cryptoCurrency', 'network', 'paymentMethod'])) {
+        return reject(new ClientError("Transak's request missing arguments"));
+      }
+
+      const headers = {
+        Accept: 'application/json',
+      };
+
+      let qs = [];
+      qs.push('partnerApiKey=' + API_KEY);
+      qs.push('fiatCurrency=' + req.body.fiatCurrency);
+      qs.push('cryptoCurrency=' + req.body.cryptoCurrency);
+      qs.push('isBuyOrSell=BUY');
+      qs.push('network=' + req.body.network);
+      qs.push('paymentMethod=' + req.body.paymentMethod);
+
+      if (req.body.fiatAmount) qs.push('fiatAmount=' + req.body.fiatAmount);
+      if (req.body.cryptoAmount) qs.push('cryptoAmount=' + req.body.cryptoAmount);
+
+      const URL: string = API + `/api/v2/currencies/price?${qs.join('&')}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
+  transakGetSignedPaymentUrl(req): { urlWithSignature: string } {
+    const appRequiredParams = [
+      'walletAddress',
+      'redirectURL',
+      'fiatAmount',
+      'fiatCurrency',
+      'network',
+      'cryptoCurrencyCode',
+      'partnerOrderId',
+      'partnerCustomerId',
+    ];
+
+    const requiredParams = req.body.context === 'web' ? [] : appRequiredParams;
+    const keys = this.transakGetKeys(req);
+    const API_KEY = keys.API_KEY;
+    const WIDGET_API = keys.WIDGET_API;
+
+    if (
+      !checkRequired(req.body, requiredParams)
+    ) {
+      throw new ClientError("Transak's request missing arguments");
+    }
+
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+
+    let qs = [];
+    // Recommended parameters to customize from the app
+    if (req.body.walletAddress) qs.push('walletAddress=' + encodeURIComponent(req.body.walletAddress));
+    if (req.body.disableWalletAddressForm) qs.push('disableWalletAddressForm=' + encodeURIComponent(req.body.disableWalletAddressForm));
+    if (req.body.redirectURL) qs.push('redirectURL=' + encodeURIComponent(req.body.redirectURL));
+    if (req.body.exchangeScreenTitle) qs.push('exchangeScreenTitle=' + encodeURIComponent(req.body.exchangeScreenTitle));
+    if (req.body.fiatAmount) qs.push('fiatAmount=' + encodeURIComponent(req.body.fiatAmount));
+    if (req.body.fiatCurrency) qs.push('fiatCurrency=' + encodeURIComponent(req.body.fiatCurrency));
+    if (req.body.network) qs.push('network=' + encodeURIComponent(req.body.network));
+    if (req.body.paymentMethod) qs.push('paymentMethod=' + encodeURIComponent(req.body.paymentMethod));
+    if (req.body.cryptoCurrencyCode) qs.push('cryptoCurrencyCode=' + encodeURIComponent(req.body.cryptoCurrencyCode));
+    if (req.body.cryptoCurrencyList) qs.push('cryptoCurrencyList=' + encodeURIComponent(req.body.cryptoCurrencyList));
+    if (req.body.hideExchangeScreen) qs.push('hideExchangeScreen=' + encodeURIComponent(req.body.hideExchangeScreen));
+    if (req.body.themeColor) qs.push('themeColor=' + encodeURIComponent(req.body.themeColor));
+    if (req.body.hideMenu) qs.push('hideMenu=' + encodeURIComponent(req.body.hideMenu));
+    if (req.body.partnerOrderId) qs.push('partnerOrderId=' + encodeURIComponent(req.body.partnerOrderId));
+    if (req.body.partnerCustomerId) qs.push('partnerCustomerId=' + encodeURIComponent(req.body.partnerCustomerId));
+    // Other parameters
+    if (req.body.environment) qs.push('environment=' + encodeURIComponent(req.body.environment));
+    if (req.body.widgetHeight) qs.push('widgetHeight=' + encodeURIComponent(req.body.widgetHeight));
+    if (req.body.widgetWidth) qs.push('widgetWidth=' + encodeURIComponent(req.body.widgetWidth));
+    if (req.body.productsAvailed) qs.push('productsAvailed=' + encodeURIComponent(req.body.productsAvailed));
+    if (req.body.defaultFiatAmount) qs.push('defaultFiatAmount=' + encodeURIComponent(req.body.defaultFiatAmount));
+    if (req.body.countryCode) qs.push('countryCode=' + encodeURIComponent(req.body.countryCode));
+    if (req.body.excludeFiatCurrencies) qs.push('excludeFiatCurrencies=' + encodeURIComponent(req.body.excludeFiatCurrencies));
+    if (req.body.defaultNetwork) qs.push('defaultNetwork=' + encodeURIComponent(req.body.defaultNetwork));
+    if (req.body.networks) qs.push('networks=' + encodeURIComponent(req.body.networks));
+    if (req.body.defaultPaymentMethod) qs.push('defaultPaymentMethod=' + encodeURIComponent(req.body.defaultPaymentMethod));
+    if (req.body.disablePaymentMethods) qs.push('disablePaymentMethods=' + encodeURIComponent(req.body.disablePaymentMethods));
+    if (req.body.defaultCryptoAmount) qs.push('defaultCryptoAmount=' + encodeURIComponent(req.body.defaultCryptoAmount));
+    if (req.body.cryptoAmount) qs.push('cryptoAmount=' + encodeURIComponent(req.body.cryptoAmount));
+    if (req.body.defaultCryptoCurrency) qs.push('defaultCryptoCurrency=' + encodeURIComponent(req.body.defaultCryptoCurrency));
+    if (req.body.isFeeCalculationHidden) qs.push('isFeeCalculationHidden=' + encodeURIComponent(req.body.isFeeCalculationHidden));
+    if (req.body.walletAddressesData) qs.push('walletAddressesData=' + encodeURIComponent(req.body.walletAddressesData));
+    if (req.body.email) qs.push('email=' + encodeURIComponent(req.body.email));
+    if (req.body.userData) qs.push('userData=' + encodeURIComponent(req.body.userData));
+    if (req.body.isAutoFillUserData) qs.push('isAutoFillUserData=' + encodeURIComponent(req.body.isAutoFillUserData));
+
+    const URL_SEARCH: string = `?apiKey=${API_KEY}&${qs.join('&')}`;
+
+    const urlWithSignature = `${WIDGET_API}${URL_SEARCH}`;
+
+    return { urlWithSignature };
+  }
+
+  transakGetOrderDetails(req): Promise<any> {
+    return new Promise(async (resolve, reject) => {
+      const env = _.cloneDeep(req.body.env);
+      const keys = this.transakGetKeys(req);
+      const API = keys.API;
+
+      if (!checkRequired(req.body, ['orderId'])) {
+        return reject(new ClientError("Transak's request missing arguments"));
+      }
+
+      let accessToken;
+      if (req.body.accessToken) {
+        accessToken = req.body.accessToken;
+      } else {
+        try {
+          const accessTokenData = await this.transakGetAccessToken({body: env});
+          accessToken = accessTokenData?.data?.accessToken;
+        } catch (err) {
+          return reject(err?.body ? err.body : err);
+        }
+      }
+
+      const headers = {
+        Accept: 'application/json',
+        'access-token': accessToken,
+      };
+
+      const URL: string = API + `/partners/api/v2/order/${req.body.orderId}`;
+
+      this.request.get(
+        URL,
+        {
+          headers,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ? err.body : err);
+          } else {
+            return resolve(data.body ? data.body : data);
+          }
+        }
+      );
+    });
+  }
+
 
   wyreWalletOrderQuotation(req): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -4599,23 +6006,45 @@ export class WalletService {
     });
   }
 
-  changellyGetKeys(req) {
+  private changellyGetKeys(req) {
     if (!config.changelly) {
       logger.warn('Changelly missing credentials');
       throw new Error('ClientError: Service not configured.');
+      if (!config.changelly.v1) {
+        logger.warn('Changelly v1 missing credentials');
+        throw new Error('ClientError: Service v1 not configured.');
+      }
     }
 
     const keys = {
-      API: config.changelly.api,
-      API_KEY: config.changelly.apiKey,
-      SECRET: config.changelly.secret
+      API: config.changelly.v1.api,
+      API_KEY: config.changelly.v1.apiKey,
+      SECRET: config.changelly.v1.secret
+    };
+
+    return keys;
+  }
+
+  private changellyGetKeysV2(req) {
+    if (!config.changelly) {
+      logger.warn('Changelly missing credentials');
+      throw new Error('ClientError: Service not configured.');
+      if (!config.changelly.v2) {
+        logger.warn('Changelly v2 missing credentials');
+        throw new Error('ClientError: Service v2 not configured.');
+      }
+    }
+
+    const keys = {
+      API: config.changelly.v2.api,
+      SECRET: config.changelly.v2.secret
     };
 
     return keys;
   }
 
   changellySignRequests(message, secret: string) {
-    if (!message || !secret) throw new Error('Missing parameters to sign Changelly request');
+    if (!message || !secret) throw new Error('Missing parameters to sign Changelly v1 request');
 
     const sign: string = Bitcore.crypto.Hash.sha512hmac(
       Buffer.from(JSON.stringify(message)),
@@ -4625,9 +6054,34 @@ export class WalletService {
     return sign;
   }
 
+
+  changellySignRequestsV2(message, secret: string) {
+    if (!message || !secret) throw new Error('Missing parameters to sign Changelly v2 request');
+
+    const privateKey = crypto.createPrivateKey({
+      key: Buffer.from(secret, 'hex'),
+      format: 'der',
+      type: 'pkcs8',
+    });
+
+    const publicKey = crypto.createPublicKey(privateKey).export({
+        type: 'pkcs1',
+        format: 'der'
+    });
+
+    const signature = crypto.sign('sha256', Buffer.from(JSON.stringify(message)), privateKey);
+
+    return {signature, publicKey};
+  }
+
   changellyGetCurrencies(req): Promise<any> {
     return new Promise((resolve, reject) => {
-      const keys = this.changellyGetKeys(req);
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
 
       if (!checkRequired(req.body, ['id'])) {
         return reject(new ClientError('changellyGetCurrencies request missing arguments'));
@@ -4641,13 +6095,22 @@ export class WalletService {
       };
 
       const URL: string = keys.API;
-      const sign: string = this.changellySignRequests(message, keys.SECRET);
 
-      const headers = {
-        'Content-Type': 'application/json',
-        sign,
-        'api-key': keys.API_KEY
-      };
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
 
       this.request.post(
         URL,
@@ -4669,7 +6132,12 @@ export class WalletService {
 
   changellyGetPairsParams(req): Promise<any> {
     return new Promise((resolve, reject) => {
-      const keys = this.changellyGetKeys(req);
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
 
       if (!checkRequired(req.body, ['id', 'coinFrom', 'coinTo'])) {
         return reject(new ClientError('changellyGetPairsParams request missing arguments'));
@@ -4688,13 +6156,21 @@ export class WalletService {
       };
 
       const URL: string = keys.API;
-      const sign: string = this.changellySignRequests(message, keys.SECRET);
-
-      const headers = {
-        'Content-Type': 'application/json',
-        sign,
-        'api-key': keys.API_KEY
-      };
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
 
       this.request.post(
         URL,
@@ -4716,7 +6192,12 @@ export class WalletService {
 
   changellyGetFixRateForAmount(req): Promise<any> {
     return new Promise((resolve, reject) => {
-      const keys = this.changellyGetKeys(req);
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
 
       if (!checkRequired(req.body, ['id', 'coinFrom', 'coinTo', 'amountFrom'])) {
         return reject(new ClientError('changellyGetFixRateForAmount request missing arguments'));
@@ -4736,13 +6217,22 @@ export class WalletService {
       };
 
       const URL: string = keys.API;
-      const sign: string = this.changellySignRequests(message, keys.SECRET);
 
-      const headers = {
-        'Content-Type': 'application/json',
-        sign,
-        'api-key': keys.API_KEY
-      };
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
 
       this.request.post(
         URL,
@@ -4764,7 +6254,12 @@ export class WalletService {
 
   changellyCreateFixTransaction(req): Promise<any> {
     return new Promise((resolve, reject) => {
-      const keys = this.changellyGetKeys(req);
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
 
       if (
         !checkRequired(req.body, [
@@ -4795,13 +6290,82 @@ export class WalletService {
       };
 
       const URL: string = keys.API;
-      const sign: string = this.changellySignRequests(message, keys.SECRET);
 
-      const headers = {
-        'Content-Type': 'application/json',
-        sign,
-        'api-key': keys.API_KEY
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
+
+      this.request.post(
+        URL,
+        {
+          headers,
+          body: message,
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            return reject(err.body ?? err);
+          } else {
+            return resolve(data.body);
+          }
+        }
+      );
+    });
+  }
+
+  changellyGetTransactions(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
+
+      if (!checkRequired(req.body, ['id', 'exchangeTxId'])) {
+        return reject(new ClientError('changellyGetTransactions request missing arguments'));
+      }
+
+      const message = {
+        id: req.body.id,
+        jsonrpc: '2.0',
+        method: 'getTransactions',
+        params:
+          {
+            id: req.body.exchangeTxId,
+            limit: req.body.limit ?? 1,
+          }
       };
+
+      const URL: string = keys.API;
+
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
 
       this.request.post(
         URL,
@@ -4823,7 +6387,12 @@ export class WalletService {
 
   changellyGetStatus(req): Promise<any> {
     return new Promise((resolve, reject) => {
-      const keys = this.changellyGetKeys(req);
+      let keys, headers;
+      if (req.body.useV2) {
+        keys = this.changellyGetKeysV2(req);
+      } else {
+        keys = this.changellyGetKeys(req);
+      }
 
       if (!checkRequired(req.body, ['id', 'exchangeTxId'])) {
         return reject(new ClientError('changellyGetStatus request missing arguments'));
@@ -4839,13 +6408,22 @@ export class WalletService {
       };
 
       const URL: string = keys.API;
-      const sign: string = this.changellySignRequests(message, keys.SECRET);
 
-      const headers = {
-        'Content-Type': 'application/json',
-        sign,
-        'api-key': keys.API_KEY
-      };
+      if (req.body.useV2) {
+        const {signature, publicKey} = this.changellySignRequestsV2(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          'X-Api-Key': crypto.createHash('sha256').update(publicKey).digest('base64'),
+          'X-Api-Signature': signature.toString('base64'),
+        };
+      } else {
+        const sign: string = this.changellySignRequests(message, keys.SECRET);
+        headers = {
+          'Content-Type': 'application/json',
+          sign,
+          'api-key': keys.API_KEY
+        };
+      }
 
       this.request.post(
         URL,
@@ -4865,11 +6443,12 @@ export class WalletService {
     });
   }
 
-  oneInchGetCredentials() {
+  private oneInchGetCredentials() {
     if (!config.oneInch) throw new Error('1Inch missing credentials');
 
     const credentials = {
       API: config.oneInch.api,
+      API_KEY: config.oneInch.apiKey,
       referrerAddress: config.oneInch.referrerAddress,
       referrerFee: config.oneInch.referrerFee
     };
@@ -4891,7 +6470,16 @@ export class WalletService {
     return new Promise((resolve, reject) => {
       const credentials = this.oneInchGetCredentials();
 
-      if (!checkRequired(req.body, ['fromTokenAddress', 'toTokenAddress', 'amount', 'fromAddress', 'slippage', 'destReceiver'])) {
+      if (
+        !checkRequired(req.body, [
+          'fromTokenAddress',
+          'toTokenAddress',
+          'amount',
+          'fromAddress',
+          'slippage',
+          'destReceiver'
+        ])
+      ) {
         return reject(new ClientError('oneInchGetSwap request missing arguments'));
       }
 
@@ -4907,10 +6495,17 @@ export class WalletService {
       qs.push('slippage=' + req.body.slippage);
       qs.push('destReceiver=' + req.body.destReceiver);
 
-      if(credentials.referrerFee) qs.push('fee=' + credentials.referrerFee);
-      if(credentials.referrerAddress) qs.push('referrerAddress=' + credentials.referrerAddress);
+      if (credentials.referrerFee) qs.push('fee=' + credentials.referrerFee);
+      if (credentials.referrerAddress) qs.push('referrerAddress=' + credentials.referrerAddress);
 
-      const URL: string = credentials.API + '/v3.0/1/swap/?' + qs.join('&');
+      const chainIdMap = {
+        eth: 1,
+        matic: 137
+      };
+
+      const chainId = chainIdMap[req.params?.['chain'] || 'eth'];
+
+      const URL: string = `${credentials.API}/v5.2/${chainId}/swap/?${qs.join('&')}`;
 
       this.request.get(
         URL,
@@ -4927,6 +6522,102 @@ export class WalletService {
         }
       );
     });
+  }
+
+  oneInchGetTokens(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+
+      const credentials = this.oneInchGetCredentials();
+      const chain = req.params?.['chain'] || 'eth';
+      const cacheKey = `oneInchTokens:${chain}`;
+
+      this.storage.checkAndUseGlobalCache(cacheKey, Defaults.ONE_INCH_CACHE_DURATION, (err, values, oldvalues) => {
+        if (err) this.logw('Could not get stored tokens list', err);
+        if (values) return resolve(values);
+
+        const headers = {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + credentials.API_KEY,
+        };
+
+        const chainIdMap = {
+          eth: 1,
+          matic: 137
+        };
+
+        const chainId = chainIdMap[chain];
+
+        const URL: string = `${credentials.API}/v5.2/${chainId}/tokens`;
+
+        this.request.get(
+          URL,
+          {
+            headers,
+            json: true
+          },
+          (err, data) => {
+            if (err) {
+              this.logw('An error occured while retrieving the token list', err);
+              if (oldvalues) {
+               this.logw('Using old cached values');
+               return resolve(oldvalues);
+              }
+              return reject(err.body ?? err);
+            } else if (data?.statusCode === 429 && oldvalues) {
+              // oneinch rate limit
+               return resolve(oldvalues);
+            } else {
+              if (!data?.body?.tokens) {
+                if (oldvalues) {
+                  this.logw('No token list available... using old cached values');
+                  return resolve(oldvalues);
+                }
+                return reject(new Error('Could not get tokens list'));
+              }
+              this.storage.storeGlobalCache(cacheKey, data.body.tokens, err => {
+                if (err) {
+                  this.logw('Could not store tokens list');
+                }
+                return resolve(data.body.tokens);
+              });
+            }
+          }
+        );
+      });
+    });
+  }
+
+  checkServiceAvailability(req): boolean {
+    if (!checkRequired(req.body, ['service', 'opts'])) {
+      throw new ClientError('checkServiceAvailability request missing arguments');
+    }
+
+    let serviceEnabled: boolean;
+
+    switch (req.body.service) {
+      case '1inch':
+        if (req.body.opts?.country?.toUpperCase() === 'US') {
+          serviceEnabled = false;
+        } else {
+          serviceEnabled = true;
+        }
+        break;
+
+      default:
+        serviceEnabled = true;
+        break;
+    }
+
+    return serviceEnabled;
+  }
+
+  getSpenderApprovalWhitelist(cb) {
+    if (Services.ERC20_SPENDER_APPROVAL_WHITELIST) {
+      return cb(null, Services.ERC20_SPENDER_APPROVAL_WHITELIST);
+    } else {
+      return cb(new Error('Could not get ERC20 spender approval whitelist'));
+    }
   }
 
   getPayId(url: string): Promise<any> {
@@ -4996,7 +6687,105 @@ export class WalletService {
       });
     });
   }
+
+  // Moralis services
+  moralisGetWalletTokenBalances(req): Promise<any> {
+    return new Promise(async(resolve, reject) => {
+      try {
+        const response = await Moralis.EvmApi.token.getWalletTokenBalances({
+          address: req.body.address,
+          chain: req.body.chain,
+          toBlock: req.body.toBlock,
+          tokenAddresses: req.body.tokenAddresses,
+        });
+      
+        return resolve(response.raw ?? response);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  moralisGetTokenAllowance(req): Promise<any> {
+    return new Promise(async(resolve, reject) => {
+      try {
+        const response = await Moralis.EvmApi.token.getTokenAllowance({
+          address: req.body.address,
+          chain: req.body.chain,
+          ownerAddress: req.body.ownerAddress,
+          spenderAddress: req.body.spenderAddress,
+        });
+      
+        return resolve(response.raw ?? response);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  moralisGetNativeBalance(req): Promise<any> {
+    return new Promise(async(resolve, reject) => {
+      try {
+        const response = await Moralis.EvmApi.balance.getNativeBalance({
+          address: req.body.address,
+          chain: req.body.chain,
+          toBlock: req.body.toBlock,
+        });
+      
+        return resolve(response.raw ?? response);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  private coinGeckoGetCredentials() {
+    if (!config.coinGecko) throw new Error('coinGecko missing credentials');
+
+    const credentials = {
+      API: config.coinGecko.api,
+    };
+
+    return credentials;
+  }
+
+  coinGeckoGetRates(req): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const credentials = this.coinGeckoGetCredentials();
+      const chain = req.params['chain'];
+      const evmBlockchainNetwork = {
+        eth: 'ethereum',
+        matic: 'polygon-pos',
+      };
+      const contractAddresses = req.params['contractAddresses']; // format example 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48,0x6b175474e89094c44da98b954eedeac495271d0f,..
+      const altCurrencies = req.params['altCurrencies']; // format example ars,aud,usd,...
+        
+      const URL: string = `${credentials.API}/v3/simple/token_price/${
+        evmBlockchainNetwork[chain]
+      }?contract_addresses=${contractAddresses}&vs_currencies=${altCurrencies}&include_24hr_change=true&include_last_updated_at=true`;
+        
+      this.request.get(
+        URL,
+        {
+          json: true
+        },
+        (err, data) => {
+          if (err) {
+            this.logw('An error occured while retrieving the token rates', err);
+            return reject(err.body ?? err);
+          } else {
+            if (!data?.body) {
+              this.logw('No token rates available');
+              return reject(new Error('Could not get tokens rates'));
+            }
+            return resolve(data.body);
+          }
+        }
+      );
+    });
+  }
 }
+
 
 function checkRequired(obj, args, cb?: (e: any) => void) {
   const missing = Utils.getMissingFields(obj, args);

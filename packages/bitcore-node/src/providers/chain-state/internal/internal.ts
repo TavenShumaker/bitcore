@@ -1,12 +1,11 @@
 import through2 from 'through2';
-import { StreamTransactionParams } from '../../../types/namespaces/ChainStateProvider';
+import { GetBlockBeforeTimeParams, StreamTransactionParams } from '../../../types/namespaces/ChainStateProvider';
 import { StreamBlocksParams } from '../../../types/namespaces/ChainStateProvider';
 
 import { Validation } from 'crypto-wallet-core';
 import { ObjectId } from 'mongodb';
 import { LoggifyClass } from '../../../decorators/Loggify';
 import { MongoBound } from '../../../models/base';
-import { IBlock } from '../../../models/baseBlock';
 import { BitcoinBlockStorage, IBtcBlock } from '../../../models/block';
 import { CacheStorage } from '../../../models/cache';
 import { CoinStorage, ICoin } from '../../../models/coin';
@@ -17,7 +16,9 @@ import { IWalletAddress, WalletAddressStorage } from '../../../models/walletAddr
 import { RPC } from '../../../rpc';
 import { Config } from '../../../services/config';
 import { Storage } from '../../../services/storage';
+import { IBlock } from '../../../types/Block';
 import { CoinJSON, SpentHeightIndicators } from '../../../types/Coin';
+import { IUtxoNetworkConfig } from '../../../types/Config';
 import {
   BroadcastTransactionParams,
   CreateWalletParams,
@@ -51,7 +52,7 @@ export class InternalStateProvider implements IChainStateService {
   }
 
   getRPC(chain: string, network: string) {
-    const RPC_PEER = Config.get().chains[chain][network].rpc;
+    const RPC_PEER = (Config.chainConfig({ chain, network }) as IUtxoNetworkConfig).rpc;
     if (!RPC_PEER) {
       throw new Error(`RPC not configured for ${chain} ${network}`);
     }
@@ -67,6 +68,9 @@ export class InternalStateProvider implements IChainStateService {
     const query = { chain, network: network.toLowerCase(), address } as any;
     if (args.unspent) {
       query.spentHeight = { $lt: SpentHeightIndicators.minimum };
+    }
+    if (args.excludeConflicting) {
+      query.mintHeight = { $gt: SpentHeightIndicators.conflicting };
     }
     return query;
   }
@@ -175,18 +179,19 @@ export class InternalStateProvider implements IChainStateService {
     return blocks[0];
   }
 
-  async getBlockBeforeTime(params: { chain: string; network: string; time: Date }) {
+  async getBlockBeforeTime(params: GetBlockBeforeTimeParams): Promise<IBlock|null> {
     const { chain, network, time } = params;
+    const date = new Date(time || Date.now());
     const [block] = await BitcoinBlockStorage.collection
       .find({
         chain,
         network,
-        timeNormalized: { $lte: new Date(time) }
+        timeNormalized: { $lte: date }
       })
       .limit(1)
       .sort({ timeNormalized: -1 })
       .toArray();
-    return block as IBlock;
+    return block;
   }
 
   async streamTransactions(params: StreamTransactionsParams) {
@@ -455,12 +460,12 @@ export class InternalStateProvider implements IChainStateService {
   }
 
   async getFee(params: GetEstimateSmartFeeParams) {
-    const { chain, network, target } = params;
-    const cacheKey = `getFee-${chain}-${network}-${target}`;
+    const { chain, network, target, mode } = params;
+    const cacheKey = `getFee-${chain}-${network}-${target}${mode ? '-' + mode.toLowerCase() : ''}`;
     return CacheStorage.getGlobalOrRefresh(
       cacheKey,
       async () => {
-        return this.getRPC(chain, network).getEstimateSmartFee(Number(target));
+        return this.getRPC(chain, network).getEstimateSmartFee(Number(target), mode);
       },
       5 * CacheStorage.Times.Minute
     );

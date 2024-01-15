@@ -124,25 +124,35 @@ function addNetwork(data) {
  * @param {Network} network
  */
 function removeNetwork(network) {
+  if (typeof network !== 'object') {
+    network = get(network);
+  }
   for (var i = 0; i < networks.length; i++) {
     if (networks[i] === network) {
       networks.splice(i, 1);
     }
   }
   for (var key in networkMaps) {
-    if (networkMaps[key] === network) {
+    if (networkMaps[key].length) {
+      const index = networkMaps[key].indexOf(network);
+      if (index >= 0) {
+        networkMaps[key].splice(index, 1);
+      }
+      if (networkMaps[key].length === 0) {
+        delete networkMaps[key];
+      }
+    } else if (networkMaps[key] === network) {
       delete networkMaps[key];
     }
-  }
-}
+  }}
 
 addNetwork({
   name: 'livenet',
   alias: 'mainnet',
   pubkeyhash: 0x30, // 48
   privatekey: 0xb0, // 176
-  scripthash: 0x05, // 5
-  scripthash2: 0x32, // 50
+  scripthash: 0x32, // 50
+  scripthash2: 0x05, // 5
   bech32prefix: 'ltc',
   xpubkey: 0x0488b21e,
   xprivkey: 0x0488ade4,

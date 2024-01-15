@@ -185,7 +185,7 @@ Transaction.prototype.checkedSerialize = function(opts) {
   var serializationError = this.getSerializationError(opts);
   if (serializationError) {
     serializationError.message += ' - For more information please see: ' +
-      'https://bitcore.io/api/lib/transaction#serialization-checks';
+      'https://github.com/bitpay/bitcore/blob/master/packages/bitcore-lib/docs/transaction.md#serialization-checks';
     throw serializationError;
   }
   return this.uncheckedSerialize();
@@ -648,7 +648,9 @@ Transaction.prototype.associateInputs = function(utxos, pubkeys, threshold, opts
     const index = this.inputs.findIndex(i => i.prevTxId.toString('hex') === utxo.txId && i.outputIndex === utxo.outputIndex);
     indexes.push(index);
     if(index >= 0) {
+      const sequenceNumber = this.inputs[index].sequenceNumber; // preserve the set sequence number
       this.inputs[index] = this._getInputFrom(utxo, pubkeys, threshold, opts);
+      this.inputs[index].sequenceNumber = sequenceNumber;
     }
   }
   return indexes;
@@ -966,7 +968,7 @@ Transaction.prototype._updateChangeOutput = function() {
   var available = this._getUnspentValue();
   var fee = this.getFee();
   var changeAmount = available - fee;
-  if (changeAmount > 0) {
+  if (changeAmount > Transaction.DUST_AMOUNT) {
     this._changeIndex = this.outputs.length;
     this._addOutput(new Output({
       script: this._changeScript,

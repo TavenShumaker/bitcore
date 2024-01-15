@@ -21,22 +21,31 @@ export const Constants = {
     REQUEST_KEY_AUTH: 'm/2' // relative to BASE
   },
   BIP45_SHARED_INDEX: 0x80000000 - 1,
-  COINS: [
-    'btc',
-    'bch',
-    'eth',
-    'xrp',
-    'doge',
-    'ltc',
+
+  // there is no need to add new entries here ( only for backwards compatiblity )
+  BITPAY_SUPPORTED_ETH_ERC20: [
+    'matic',
     'usdc',
+    'pyusd',
     'pax',
     'gusd',
     'busd',
     'dai',
-    'wbtc'
+    'wbtc',
+    'shib',
+    'ape',
+    'euroc',
+    'usdt'
   ],
-  ERC20: ['usdc', 'pax', 'gusd', 'busd', 'dai', 'wbtc'],
-  UTXO_COINS: ['btc', 'bch', 'doge', 'ltc'],
-  TOKEN_OPTS: CWC.Constants.TOKEN_OPTS,
-  UNITS: CWC.Constants.UNITS
+
+  CHAINS: ['btc', 'bch', 'eth', 'matic', 'xrp', 'doge', 'ltc'],
+  UTXO_CHAINS: ['btc', 'bch', 'doge', 'ltc'],
+  EVM_CHAINS: ['eth', 'matic'],
+  ETH_TOKEN_OPTS: CWC.Constants.ETH_TOKEN_OPTS,
+  MATIC_TOKEN_OPTS: CWC.Constants.MATIC_TOKEN_OPTS,
+  UNITS: CWC.Constants.UNITS,
+  EVM_CHAINSUFFIXMAP: {
+    eth: 'e',
+    matic: 'm'
+  }
 };

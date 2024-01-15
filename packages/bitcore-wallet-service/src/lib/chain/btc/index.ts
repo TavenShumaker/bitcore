@@ -1,17 +1,18 @@
 import * as async from 'async';
 import { BitcoreLib } from 'crypto-wallet-core';
 import _ from 'lodash';
-import { IChain, INotificationData } from '..';
+import { IChain } from '..';
+import config from '../../../config';
+import { Common } from '../../common';
 import { ClientError } from '../../errors/clienterror';
+import { Errors } from '../../errors/errordefinitions';
 import logger from '../../logger';
 import { TxProposal } from '../../model';
+
 const $ = require('preconditions').singleton();
-const Common = require('../../common');
 const Constants = Common.Constants;
 const Utils = Common.Utils;
 const Defaults = Common.Defaults;
-const Errors = require('../../errors/errordefinitions');
-const config = require('../../../config');
 
 export class BtcChain implements IChain {
   protected sizeEstimationMargin: number;
@@ -187,7 +188,8 @@ export class BtcChain implements IChain {
               return cb(null, address);
             });
           } else {
-            return cb(null, wallet.createAddress(true), true);
+            const escrowInputs = opts.instantAcceptanceEscrow ? opts.inputs : undefined;
+            return cb(null, wallet.createAddress(true, undefined, escrowInputs), true);
           }
         }
       };
@@ -228,7 +230,7 @@ export class BtcChain implements IChain {
         return 46 + txp.requiredSignatures * SIGNATURE_SIZE + txp.walletN * PUBKEY_SIZE + inputSafetyMargin;
 
       default:
-        logger.warn('Unknown address type at getEstimatedSizeForSingleInput:', txp.addressType);
+        logger.warn('Unknown address type at getEstimatedSizeForSingleInput: %o', txp.addressType);
         return 46 + txp.requiredSignatures * SIGNATURE_SIZE + txp.walletN * PUBKEY_SIZE + inputSafetyMargin;
     }
   }
@@ -241,7 +243,10 @@ export class BtcChain implements IChain {
       const a = this.bitcoreLib.Address(address);
       addressType = a.type;
     }
+    return this.getEstimatedSizeForAddressType(addressType);
+  }
 
+  getEstimatedSizeForAddressType(addressType?: string) {
     let scriptSize;
     switch (addressType) {
       case 'pubkeyhash':
@@ -258,7 +263,7 @@ export class BtcChain implements IChain {
         break;
       default:
         scriptSize = 34;
-        // logger.warn('Unknown address type at getEstimatedSizeForSingleOutput:', addressType);
+        // logger.warn('Unknown address type at getEstimatedSizeForSingleOutput: %o', addressType);
         break;
     }
     return scriptSize + 8 + 1; // value + script length
@@ -278,6 +283,10 @@ export class BtcChain implements IChain {
     _.each(addresses, x => {
       outputsSize += this.getEstimatedSizeForSingleOutput(x);
     });
+
+    if (opts && opts.instantAcceptanceEscrow) {
+      outputsSize += this.getEstimatedSizeForAddressType('scripthash');
+    }
 
     // If there is no *output* yet defined, (eg: get sendmax info), add a single, default, output);
     if (!outputsSize) {
@@ -303,6 +312,7 @@ export class BtcChain implements IChain {
 
     if (!fee) {
       fee = (txp.feePerKb * this.getEstimatedSize(txp, opts)) / 1000;
+      fee = Math.max(fee, this.bitcoreLib.Transaction.DUST_AMOUNT);
     }
     return parseInt(fee.toFixed(0));
   }
@@ -377,6 +387,12 @@ export class BtcChain implements IChain {
 
     t.fee(txp.fee);
 
+    if (txp.instantAcceptanceEscrow && txp.escrowAddress) {
+      t.escrow(txp.escrowAddress.address, txp.instantAcceptanceEscrow + txp.fee);
+    }
+
+    if (txp.enableRBF) t.enableRBF();
+
     if (txp.changeAddress) {
       t.change(txp.changeAddress.address);
     }
@@ -444,7 +460,7 @@ export class BtcChain implements IChain {
         txp.fee = bitcoreTx.getFee();
       }
     } catch (ex) {
-      logger.warn('Error building Bitcore transaction', ex);
+      logger.warn('Error building Bitcore transaction: %o', ex);
       return ex;
     }
 
@@ -465,6 +481,11 @@ export class BtcChain implements IChain {
 
   checkTxUTXOs(server, txp, opts, cb) {
     logger.debug('Rechecking UTXOs availability for publishTx');
+
+    if (txp.replaceTxByFee) {
+      logger.debug('Ignoring spend utxos check (Replacing tx designated as RBF)');
+      return cb();
+    }
 
     const utxoKey = utxo => {
       return utxo.txid + '|' + utxo.vout;
@@ -509,13 +530,17 @@ export class BtcChain implements IChain {
     const MAX_TX_SIZE_IN_KB = Defaults.MAX_TX_SIZE_IN_KB_BTC;
 
     // todo: check inputs are ours and have enough value
-    if (txp.inputs && !_.isEmpty(txp.inputs)) {
+    if (txp.inputs && !_.isEmpty(txp.inputs) && !txp.replaceTxByFee) {
       if (!_.isNumber(txp.fee)) txp.fee = this.getEstimatedFee(txp, { conservativeEstimation: true });
       return cb(this.checkTx(txp));
     }
 
-    const feeOpts = { conservativeEstimation: opts.payProUrl ? true : false };
-    const txpAmount = txp.getTotalAmount();
+    const feeOpts = {
+      conservativeEstimation: opts.payProUrl ? true : false,
+      instantAcceptanceEscrow: opts.instantAcceptanceEscrow
+    };
+    const escrowAmount = opts.instantAcceptanceEscrow || 0;
+    const txpAmount = txp.getTotalAmount() + escrowAmount;
     const baseTxpSize = this.getEstimatedSize(txp, feeOpts);
     const baseTxpFee = (baseTxpSize * txp.feePerKb) / 1000;
     const sizePerInput = this.getEstimatedSizeForSingleInput(txp, feeOpts);
@@ -539,7 +564,7 @@ export class BtcChain implements IChain {
 
       return _.filter(utxos, utxo => {
         if (utxo.locked) return false;
-        if (txp.excludeUnconfirmedUtxos && !utxo.confirmations) return false;
+        if (txp.excludeUnconfirmedUtxos && !txp.replaceTxByFee && !utxo.confirmations) return false;
         if (excludeIndex[utxo.txid + ':' + utxo.vout]) return false;
         return true;
       });
@@ -608,6 +633,7 @@ export class BtcChain implements IChain {
       let total = 0;
       let netTotal = -baseTxpFee;
       let selected = [];
+      let fullTxpAmount = txpAmount;
       let fee;
       let error;
 
@@ -626,10 +652,15 @@ export class BtcChain implements IChain {
         const txpSize = baseTxpSize + selected.length * sizePerInput;
         fee = Math.round(baseTxpFee + selected.length * feePerInput);
 
+        // The escrow address must contain the instantAcceptanceEscrow satoshis specified
+        // by the merchant plus the miner fee on the ZCE-secured payment.
+        // Rationale: https://github.com/bitjson/bch-zce#zce-extension-to-json-payment-protocol
+        fullTxpAmount = escrowAmount ? txpAmount + fee : txpAmount;
+
         logger.debug('Tx size: ' + Utils.formatSize(txpSize) + ', Tx fee: ' + Utils.formatAmountInBtc(fee));
 
-        const feeVsAmountRatio = fee / txpAmount;
-        const amountVsUtxoRatio = netInputAmount / txpAmount;
+        const feeVsAmountRatio = fee / fullTxpAmount;
+        const amountVsUtxoRatio = netInputAmount / fullTxpAmount;
 
         // logger.debug('Fee/Tx amount: ' + Utils.formatRatio(feeVsAmountRatio) + ' (max: ' + Utils.formatRatio(Defaults.UTXO_SELECTION_MAX_FEE_VS_TX_AMOUNT_FACTOR) + ')');
         // logger.debug('Tx amount/Input amount:' + Utils.formatRatio(amountVsUtxoRatio) + ' (min: ' + Utils.formatRatio(Defaults.UTXO_SELECTION_MIN_TX_AMOUNT_VS_UTXO_FACTOR) + ')');
@@ -663,9 +694,9 @@ export class BtcChain implements IChain {
             Utils.formatAmountInBtc(netTotal)
         );
 
-        if (netTotal >= txpAmount) {
-          const changeAmount = Math.round(total - txpAmount - fee);
-          logger.debug('Tx change: ', Utils.formatAmountInBtc(changeAmount));
+        if (netTotal >= fullTxpAmount) {
+          const changeAmount = Math.round(total - fullTxpAmount - fee);
+          logger.debug('Tx change: %o', Utils.formatAmountInBtc(changeAmount));
 
           const dustThreshold = Math.max(Defaults.MIN_OUTPUT_AMOUNT, this.bitcoreLib.Transaction.DUST_AMOUNT);
           if (changeAmount > 0 && changeAmount <= dustThreshold) {
@@ -682,18 +713,18 @@ export class BtcChain implements IChain {
         }
       });
 
-      if (netTotal < txpAmount) {
+      if (netTotal < fullTxpAmount) {
         logger.debug(
           'Could not reach Txp total (' +
-            Utils.formatAmountInBtc(txpAmount) +
+            Utils.formatAmountInBtc(fullTxpAmount) +
             '), still missing: ' +
-            Utils.formatAmountInBtc(txpAmount - netTotal)
+            Utils.formatAmountInBtc(fullTxpAmount - netTotal)
         );
 
         selected = [];
         if (!_.isEmpty(bigInputs)) {
           const input = _.head(bigInputs);
-          logger.debug('Using big input: ', Utils.formatUtxos(input));
+          logger.debug('Using big input: %o', Utils.formatUtxos(input));
           total = input.satoshis;
           fee = Math.round(baseTxpFee + feePerInput);
           netTotal = total - fee;
@@ -722,100 +753,122 @@ export class BtcChain implements IChain {
 
     // logger.debug('Selecting inputs for a ' + Utils.formatAmountInBtc(txp.getTotalAmount()) + ' txp');
 
-    server.getUtxosForCurrentWallet({}, (err, utxos) => {
-      if (err) return cb(err);
+    server.getUtxosForCurrentWallet(
+      {
+        instantAcceptanceEscrow: txp.instantAcceptanceEscrow,
+        replaceTxByFee: txp.replaceTxByFee,
+        inputs: txp.inputs
+      },
+      (err, utxos) => {
+        if (err) return cb(err);
 
-      let totalAmount;
-      let availableAmount;
+        let totalAmount;
+        let availableAmount;
 
-      const balance = this.totalizeUtxos(utxos);
-      if (txp.excludeUnconfirmedUtxos) {
-        totalAmount = balance.totalConfirmedAmount;
-        availableAmount = balance.availableConfirmedAmount;
-      } else {
-        totalAmount = balance.totalAmount;
-        availableAmount = balance.availableAmount;
-      }
+        const balance = this.totalizeUtxos(utxos);
+        if (txp.excludeUnconfirmedUtxos && !txp.replaceTxByFee) {
+          totalAmount = balance.totalConfirmedAmount;
+          availableAmount = balance.availableConfirmedAmount;
+        } else {
+          totalAmount = balance.totalAmount;
+          availableAmount = balance.availableAmount;
+        }
 
-      if (totalAmount < txp.getTotalAmount()) return cb(Errors.INSUFFICIENT_FUNDS);
-      if (availableAmount < txp.getTotalAmount()) return cb(Errors.LOCKED_FUNDS);
+        if (totalAmount < txp.getTotalAmount()) return cb(Errors.INSUFFICIENT_FUNDS);
+        if (availableAmount < txp.getTotalAmount()) return cb(Errors.LOCKED_FUNDS);
 
-      utxos = sanitizeUtxos(utxos);
+        utxos = sanitizeUtxos(utxos);
 
-      // logger.debug('Considering ' + utxos.length + ' utxos (' + Utils.formatUtxos(utxos) + ')');
+        // logger.debug('Considering ' + utxos.length + ' utxos (' + Utils.formatUtxos(utxos) + ')');
 
-      const groups = [6, 1];
-      if (!txp.excludeUnconfirmedUtxos) groups.push(0);
+        const groups = [6, 1];
+        if (!txp.excludeUnconfirmedUtxos) groups.push(0);
 
-      let inputs = [];
-      let fee;
-      let selectionError;
-      let i = 0;
-      let lastGroupLength;
-      async.whilst(
-        () => {
-          return i < groups.length && _.isEmpty(inputs);
-        },
-        next => {
-          const group = groups[i++];
+        let inputs = [];
+        let fee;
+        let selectionError;
+        let i = 0;
+        let lastGroupLength;
+        async.whilst(
+          () => {
+            return i < groups.length && _.isEmpty(inputs);
+          },
+          next => {
+            const group = groups[i++];
 
-          const candidateUtxos = _.filter(utxos, utxo => {
-            return utxo.confirmations >= group;
-          });
+            let candidateUtxos = _.filter(utxos, utxo => {
+              return utxo.confirmations >= group;
+            });
 
-          // logger.debug('Group >= ' + group);
+            if (opts.instantAcceptanceEscrow && wallet.isZceCompatible()) {
+              const utxosSortedByDescendingAmount = candidateUtxos.sort((a, b) => b.amount - a.amount);
+              const utxosWithUniqueAddresses = _.uniqBy(utxosSortedByDescendingAmount, 'address');
+              candidateUtxos = utxosWithUniqueAddresses;
+            }
 
-          // If this group does not have any new elements, skip it
-          if (lastGroupLength === candidateUtxos.length) {
-            // logger.debug('This group is identical to the one already explored');
-            return next();
-          }
+            if (txp.replaceTxByFee) {
+              // make sure we are using at least one input from the transaction that we are replacing
+              const txIdArray: any[] = _.map(opts.inputs, 'txid');
+              candidateUtxos = candidateUtxos.sort((a, b) => {
+                return txIdArray.indexOf(b.txid) - txIdArray.indexOf(a.txid);
+              });
+            }
 
-          // logger.debug('Candidate utxos: ' + Utils.formatUtxos(candidateUtxos));
+            // logger.debug('Group >= ' + group);
 
-          lastGroupLength = candidateUtxos.length;
-
-          select(candidateUtxos, txp.coin, (err, selectedInputs, selectedFee) => {
-            if (err) {
-              // logger.debug('No inputs selected on this group: ', err);
-              selectionError = err;
+            // If this group does not have any new elements, skip it
+            if (lastGroupLength === candidateUtxos.length) {
+              // logger.debug('This group is identical to the one already explored');
               return next();
             }
 
-            selectionError = null;
-            inputs = selectedInputs;
-            fee = selectedFee;
+            // logger.debug('Candidate utxos: ' + Utils.formatUtxos(candidateUtxos));
 
-            logger.debug('Selected inputs from this group: ' + Utils.formatUtxos(inputs));
-            logger.debug('Fee for this selection: ' + Utils.formatAmountInBtc(fee));
+            lastGroupLength = candidateUtxos.length;
 
-            return next();
-          });
-        },
-        err => {
-          if (err) return cb(err);
-          if (selectionError || _.isEmpty(inputs)) return cb(selectionError || new Error('Could not select tx inputs'));
+            select(candidateUtxos, txp.coin, (err, selectedInputs, selectedFee) => {
+              if (err) {
+                // logger.debug('No inputs selected on this group: ', err);
+                selectionError = err;
+                return next();
+              }
 
-          txp.setInputs(_.shuffle(inputs));
-          txp.fee = fee;
+              selectionError = null;
+              inputs = selectedInputs;
+              fee = selectedFee;
 
-          err = this.checkTx(txp);
-          if (!err) {
-            const change = _.sumBy(txp.inputs, 'satoshis') - _.sumBy(txp.outputs, 'amount') - txp.fee;
-            logger.debug(
-              'Successfully built transaction. Total fees: ' +
-                Utils.formatAmountInBtc(txp.fee) +
-                ', total change: ' +
-                Utils.formatAmountInBtc(change)
-            );
-          } else {
-            logger.warn('Error building transaction', err);
+              logger.debug('Selected inputs from this group: ' + Utils.formatUtxos(inputs));
+              logger.debug('Fee for this selection: ' + Utils.formatAmountInBtc(fee));
+
+              return next();
+            });
+          },
+          err => {
+            if (err) return cb(err);
+            if (selectionError || _.isEmpty(inputs))
+              return cb(selectionError || new Error('Could not select tx inputs'));
+
+            txp.setInputs(_.shuffle(inputs));
+            txp.fee = fee;
+
+            err = this.checkTx(txp);
+            if (!err) {
+              const change = _.sumBy(txp.inputs, 'satoshis') - _.sumBy(txp.outputs, 'amount') - txp.fee;
+              logger.debug(
+                'Successfully built transaction. Total fees: ' +
+                  Utils.formatAmountInBtc(txp.fee) +
+                  ', total change: ' +
+                  Utils.formatAmountInBtc(change)
+              );
+            } else {
+              logger.warn('Error building transaction: %o', err);
+            }
+
+            return cb(err);
           }
-
-          return cb(err);
-        }
-      );
-    });
+        );
+      }
+    );
   }
 
   checkUtxos(opts) {
@@ -839,7 +892,7 @@ export class BtcChain implements IChain {
     return true;
   }
 
-  isUTXOCoin() {
+  isUTXOChain() {
     return true;
   }
   isSingleAddress() {
@@ -857,7 +910,7 @@ export class BtcChain implements IChain {
     let i = 0;
     const x = new this.bitcoreLib.HDPublicKey(xpub);
 
-    _.each(signatures, signatureHex => {
+    for (const signatureHex of signatures) {
       try {
         const signature = this.bitcoreLib.crypto.Signature.fromString(signatureHex);
         const pub = x.deriveChild(inputPaths[i]).publicKey;
@@ -870,7 +923,7 @@ export class BtcChain implements IChain {
         tx.inputs[i].addSignature(tx, s, signingMethod);
         i++;
       } catch (e) {}
-    });
+    }
 
     if (i != tx.inputs.length) throw new Error('Wrong signatures');
   }
@@ -886,10 +939,21 @@ export class BtcChain implements IChain {
     } catch (ex) {
       throw Errors.INVALID_ADDRESS;
     }
-    if (addr.network.toString() != wallet.network) {
+    if (!this._isCorrectNetwork(wallet, addr)) {
       throw Errors.INCORRECT_ADDRESS_NETWORK;
     }
     return;
+  }
+
+  protected _isCorrectNetwork(wallet, addr) {
+    const addrNetwork = addr.network.toString();
+    const walNetwork = wallet.network;
+    const walChain = wallet.chain || wallet.coin; // wallet.coin is for backward compatibility
+
+    if (addrNetwork === 'regtest' && walNetwork === 'testnet') {
+      return config.blockchainExplorerOpts?.[walChain]?.testnet?.regtestEnabled;
+    }
+    return addrNetwork === walNetwork;
   }
 
   // Push notification handling

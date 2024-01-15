@@ -1,7 +1,53 @@
-const _ = require('lodash');
 import { ClientError } from './clienterror';
 
-const errors = {
+
+interface Errors<T> {
+  AD_ALREADY_EXISTS: T;
+  BAD_SIGNATURES: T;
+  COPAYER_DATA_MISMATCH: T;
+  COPAYER_IN_WALLET: T;
+  COPAYER_REGISTERED: T;
+  COPAYER_VOTED: T;
+  DUST_AMOUNT: T;
+  MORE_THAT_ONE_OUTPUT: T;
+  INCORRECT_ADDRESS_NETWORK: T;
+  ONLY_CASHADDR: T;
+  INSUFFICIENT_FUNDS: T;
+  INSUFFICIENT_FUNDS_FOR_FEE: T;
+  INSUFFICIENT_ETH_FEE: T;
+  INSUFFICIENT_MATIC_FEE: T;
+  INVALID_ADDRESS: T;
+  INVALID_CHANGE_ADDRESS: T;
+  KEY_IN_COPAYER: T;
+  LOCKED_FUNDS: T;
+  LOCKED_ETH_FEE: T;
+  LOCKED_MATIC_FEE: T;
+  HISTORY_LIMIT_EXCEEDED: T;
+  MAIN_ADDRESS_GAP_REACHED: T;
+  NETWORK_SUSPENDED: T;
+  NOT_AUTHORIZED: T;
+  TOO_MANY_KEYS: T;
+  TX_ALREADY_BROADCASTED: T;
+  TX_CANNOT_CREATE: T;
+  TX_CANNOT_REMOVE: T;
+  TX_MAX_SIZE_EXCEEDED: T;
+  TX_NOT_ACCEPTED: T;
+  TX_NOT_FOUND: T;
+  TX_NOT_PENDING: T;
+  TX_NONCE_CONFLICT: T;
+  UNAVAILABLE_UTXOS: T;
+  NO_INPUT_PATHS: T;
+  UPGRADE_NEEDED: T;
+  WALLET_ALREADY_EXISTS: T;
+  WALLET_FULL: T;
+  WALLET_BUSY: T;
+  WALLET_NOT_COMPLETE: T;
+  WALLET_NOT_FOUND: T;
+  WALLET_NEED_SCAN: T;
+  WRONG_SIGNING_METHOD: T;
+};
+
+const errors: Errors<string> = {
   AD_ALREADY_EXISTS: 'Ad already exists',
   BAD_SIGNATURES: 'Bad signatures',
   COPAYER_DATA_MISMATCH: 'Copayer data mismatch',
@@ -15,11 +61,13 @@ const errors = {
   INSUFFICIENT_FUNDS: 'Insufficient funds',
   INSUFFICIENT_FUNDS_FOR_FEE: 'Insufficient funds for fee',
   INSUFFICIENT_ETH_FEE: 'Your linked ETH wallet does not have enough ETH for fee',
+  INSUFFICIENT_MATIC_FEE: 'Your linked POLYGON wallet does not have enough MATIC for fee',
   INVALID_ADDRESS: 'Invalid address',
   INVALID_CHANGE_ADDRESS: 'Invalid change address',
   KEY_IN_COPAYER: 'Key already registered',
   LOCKED_FUNDS: 'Funds are locked by pending transaction proposals',
   LOCKED_ETH_FEE: 'Your linked ETH wallet does not have enough ETH for fee',
+  LOCKED_MATIC_FEE: 'Your linked POLYGON wallet does not have enough MATIC for fee',
   HISTORY_LIMIT_EXCEEDED: 'Requested page limit is above allowed maximum',
   MAIN_ADDRESS_GAP_REACHED: 'Maximum number of consecutive addresses without activity reached',
   NETWORK_SUSPENDED: '$network operations are currently suspended. Please check status.bitpay.com for further updates.',
@@ -32,6 +80,7 @@ const errors = {
   TX_NOT_ACCEPTED: 'The transaction proposal is not accepted',
   TX_NOT_FOUND: 'Transaction proposal not found',
   TX_NOT_PENDING: 'The transaction proposal is not pending',
+  TX_NONCE_CONFLICT: 'Unsigned TX proposal(s) with lower or conflicting nonces exist. Please sign or reject them first.',
   UNAVAILABLE_UTXOS: 'Unavailable unspent outputs',
   NO_INPUT_PATHS: 'Derivation paths were not provided for the inputs',
   UPGRADE_NEEDED: 'Client app needs to be upgraded',
@@ -44,14 +93,11 @@ const errors = {
   WRONG_SIGNING_METHOD: 'Wrong signed method for coin/network'
 };
 
-const errorObjects = _.fromPairs(
-  _.map(errors, (msg, code) => {
-    return [code, new ClientError(code, msg)];
-  })
-);
+const errorsObject = { codes: {} };
 
-errorObjects.codes = _.mapValues(errors, (v, k) => {
-  return k;
-});
+for (const [code, msg] of Object.entries(errors)) {
+  errorsObject[code] = new ClientError(code, msg);
+  errorsObject.codes[code] = code;
+}
 
-module.exports = errorObjects;
+export const Errors = errorsObject as Errors<ClientError> & { codes: Errors<string> };

@@ -135,7 +135,7 @@ export class XrpP2pWorker extends BaseP2PWorker<any> {
   }
 
   async syncWallets() {
-    return new Promise(async resolve => {
+    return new Promise<void>(async resolve => {
       try {
         const { chain, network } = this;
 
@@ -219,8 +219,8 @@ export class XrpP2pWorker extends BaseP2PWorker<any> {
             );
             resolve();
           });
-      } catch (e) {
-        logger.error(e);
+      } catch (e: any) {
+        logger.error('%o', e);
       }
     });
   }
@@ -236,7 +236,7 @@ export class XrpP2pWorker extends BaseP2PWorker<any> {
 
     if (!ourBestBlock || this.chainConfig.walletOnlySync) {
       let configuredStart = this.chainConfig.startHeight;
-      const shouldResume = !configuredStart || ourBestBlock.height > configuredStart;
+      const shouldResume = !configuredStart || ourBestBlock?.height > configuredStart;
       if (ourBestBlock && shouldResume) {
         configuredStart = ourBestBlock.height;
       }
@@ -251,11 +251,30 @@ export class XrpP2pWorker extends BaseP2PWorker<any> {
     let currentHeight = startHeight;
     while (ourBestBlock.height < chainBestBlock) {
       currentHeight = ourBestBlock.height + 1;
-      const block = await client.getLedger({
-        ledgerVersion: currentHeight,
-        includeTransactions: true,
-        includeAllData: true
-      });
+      let block;
+      try {
+        block = await client.getLedger({
+          ledgerVersion: currentHeight,
+          includeTransactions: true,
+          includeAllData: true
+        });
+      } catch (e) {
+        // Patch fix for some transactions not parsing.
+        block = await client.getLedger({
+          ledgerVersion: currentHeight,
+          includeTransactions: true,
+          includeAllData: false
+        });
+        block.transactions = [];
+        for (let txid of block.transactionHashes as string[]) {
+          try {
+            const tx = await client.getTransaction(txid);
+            block.transactions.push(tx);
+          } catch (e) {
+            logger.warn(`Unparseable transaction. Skipping: Block ${currentHeight} Txid: ${txid} Error: %o`, e);
+          }
+        }
+      }
       if (!block) {
         await wait(2000);
         continue;
@@ -323,8 +342,8 @@ export class XrpP2pWorker extends BaseP2PWorker<any> {
       );
       this.events.emit('SYNCDONE');
       return true;
-    } catch (e) {
-      logger.error(e);
+    } catch (e: any) {
+      logger.error('%o', e);
       this.syncing = false;
       await wait(2000);
       return this.sync();
