@@ -6,7 +6,7 @@ import 'source-map-support/register';
 import config from '../config';
 import { Common } from './common';
 import { ClientError } from './errors/clienterror';
-import { Errors } from'./errors/errordefinitions';
+import { Errors } from './errors/errordefinitions';
 import { logger, transport } from './logger';
 import { LogMiddleware } from './middleware';
 import { WalletService } from './server';
@@ -1160,6 +1160,17 @@ export class ExpressApp {
       });
     });
 
+    router.get('/v1/txproposalsbyhash/:id/', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        req.body.txid = req.params['id'];
+        server.getTxByHash(req.body, (err, tx) => {
+          if (err) return returnError(err, res, req);
+          res.json(tx);
+          res.end();
+        });
+      });
+    });
+
     router.get('/v1/txhistory/', (req, res) => {
       getServerWithAuth(req, res, server => {
         const opts: {
@@ -2095,6 +2106,40 @@ export class ExpressApp {
       }
 
       server.moralisGetNativeBalance(req)
+        .then(response => {
+          res.json(response);
+        })
+        .catch(err => {
+          return returnError(err ?? 'unknown', res, req);
+        });
+    });
+
+    router.post('/v1/moralis/GetTokenPrice', cors(moralisCorsOptions), (req, res) => {
+      let server;
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+
+      server.moralisGetTokenPrice(req)
+        .then(response => {
+          res.json(response);
+        })
+        .catch(err => {
+          return returnError(err ?? 'unknown', res, req);
+        });
+    });
+
+    router.post('/v1/moralis/getMultipleERC20TokenPrices', cors(moralisCorsOptions), (req, res) => {
+      let server;
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+
+      server.moralisGetMultipleERC20TokenPrices(req)
         .then(response => {
           res.json(response);
         })

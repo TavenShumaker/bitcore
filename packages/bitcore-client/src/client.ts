@@ -26,6 +26,14 @@ export class Client {
 
   }
 
+  _buildQueryString( params: any) {
+    let query = [];
+    for (const [key, value] of Object.entries(params)) {
+      value && query.push(`${key}=${value}`);
+    }
+    return query.length ? `?${query.join('&')}` : '';
+  }
+
   getMessage(params: { method: string; url: string; payload?: any }) {
     const { method, url, payload = {} } = params;
     const parsedUrl = new URLClass(url);
@@ -141,8 +149,18 @@ export class Client {
   }
 
   async getFee(params) {
-    const { target } = params;
-    const url = `${this.apiUrl}/fee/${target}`;
+    const { target, txType } = params;
+    const url = `${this.apiUrl}/fee/${target}${this._buildQueryString({ txType })}`;
+    const result = await this._request({ method: 'GET', url, json: true });
+    if (result.errors?.length) {
+      throw new Error(result.errors[0]);
+    }
+    return result;
+  }
+
+  async getPriorityFee(params) {
+    const { percentile } = params;
+    let url = `${this.apiUrl}/priorityFee/${percentile}`;
     const result = await this._request({ method: 'GET', url, json: true });
     if (result.errors?.length) {
       throw new Error(result.errors[0]);

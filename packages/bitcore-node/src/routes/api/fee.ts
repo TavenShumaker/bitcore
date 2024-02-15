@@ -15,10 +15,11 @@ const feeModes = {
 
 router.get('/:target', CacheMiddleware(CacheTimes.Second), async (req: Request, res: Response) => {
   let { target, chain, network } = req.params;
-  let { mode } = req.query;
+  let { mode, txType } = req.query;
   if (!chain || !network) {
     return res.status(400).send('Missing required param');
   }
+
   chain = chain.toUpperCase();
   network = network.toLowerCase();
   mode = mode?.toUpperCase();
@@ -33,13 +34,18 @@ router.get('/:target', CacheMiddleware(CacheTimes.Second), async (req: Request, 
   } else if (!feeModes[chain]?.includes(mode)) {
     return res.status(400).send('invalid mode specified');
   }
-  const feeCacheKey = `${chain}:${network}:${target}${mode ? ':' + mode : ''}`;
+  if (txType && txType.toString() != '2') {
+    return res.status(400).send('invalid txType specified');
+  }
+  let feeCacheKey = `${chain}:${network}:${target}`;
+  feeCacheKey += `${mode ? ':' + mode : ''}`;
+  feeCacheKey += `${txType ? ':type' + txType : ''}`;
   const cachedFee = feeCache[feeCacheKey];
   if (cachedFee && cachedFee.date > Date.now() - 10 * 1000) {
     return res.json(cachedFee.fee);
   }
   try {
-    let fee = await ChainStateProvider.getFee({ chain, network, target: targetNum, mode });
+    let fee = await ChainStateProvider.getFee({ chain, network, target: targetNum, mode, txType });
     if (!fee) {
       return res.status(404).send('not available right now');
     }
